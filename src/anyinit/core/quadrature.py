@@ -159,7 +159,7 @@ def gamma_laguerre_nodes(
     t, w = np.polynomial.laguerre.laggauss(nodes)
     with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
         logw = np.log(w) + (shape - 1.0) * np.log(t)
-    logw -= logw.max()
+    logw -= np.max(logw)
     weights = np.exp(logw)
     weights = weights / weights.sum()
     return scale * t, weights

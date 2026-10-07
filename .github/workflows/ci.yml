@@ -37,6 +37,10 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install
+        # The CPU build of torch: the default Linux wheel pulls in triton, which segfaults
+        # on import once TensorFlow is loaded in the same process.
+        env:
+          PIP_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cpu
         run: pip install -e '.[dev]' ${{ matrix.frameworks }}
       - run: pytest -q -m "not slow" --cov=anyinit --cov-report=xml
       - name: Upload coverage

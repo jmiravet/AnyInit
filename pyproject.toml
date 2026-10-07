@@ -92,12 +92,14 @@ ignore_missing_imports = true
 
 # The core is pure NumPy and is held to strict typing.  The backends necessarily cross
 # into third-party APIs that are untyped or typed as Any -- reading a torch tensor,
-# calling into flax.traverse_util -- so the two checks that fire on every such crossing
-# are relaxed there rather than papered over with a cast at each site.
+# calling into flax.traverse_util, subclassing torch.fx.Tracer -- so the checks that fire
+# on every such crossing are relaxed there rather than papered over with a cast at each
+# site.  Without the framework installed its classes are Any, hence the subclassing one.
 [[tool.mypy.overrides]]
 module = "anyinit.backends.*"
 warn_return_any = false
 disallow_untyped_calls = false
+disallow_subclassing_any = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
