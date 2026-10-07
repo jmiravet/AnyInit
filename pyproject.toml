@@ -1,0 +1,105 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "anyinit"
+version = "0.1.0"
+description = "Initialize any model, in any framework, correctly — with one call"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+  { name = "Jose I. Mestre", email = "jmiravet@uji.es" },
+  { name = "Alberto Fernández-Hernández", email = "a.fernandez@upv.es" },
+]
+maintainers = [{ name = "Jose I. Mestre", email = "jmiravet@uji.es" }]
+requires-python = ">=3.10"
+keywords = [
+  "deep-learning",
+  "initialization",
+  "weight-initialization",
+  "signal-propagation",
+  "pytorch",
+  "tensorflow",
+  "keras",
+  "jax",
+  "flax",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Science/Research",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Typing :: Typed",
+]
+dependencies = ["numpy>=1.21"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "pytest-cov", "ruff", "mypy"]
+
+[project.urls]
+Homepage = "https://github.com/jmiravet/AnyInit"
+Documentation = "https://jmiravet.github.io/AnyInit/"
+Repository = "https://github.com/jmiravet/AnyInit"
+Issues = "https://github.com/jmiravet/AnyInit/issues"
+Changelog = "https://github.com/jmiravet/AnyInit/blob/main/CHANGELOG.md"
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "tests", "docs", "examples", "CHANGELOG.md"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/anyinit"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+# The tutorial pages embed the examples through snippet directives, which are not Python.
+extend-exclude = ["docs/tutorials"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RET", "C4", "PIE", "N", "D", "PERF", "RUF"]
+ignore = [
+  "B008",   # function calls in argument defaults: used for dataclass-style factories
+  "B017",   # assertRaises(Exception): a test deliberately checks "anything at all"
+  "RUF002", # non-ASCII in docstrings: the mathematics reads better with real symbols
+  "RUF003",
+  "D105",   # magic methods: __len__ and friends are self-evident
+  "D107",   # __init__: its arguments are documented on the class, per Google style
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+# Tests and scripts document themselves through their names and module docstrings; only
+# the non-obvious ones carry prose.
+"tests/*" = ["D100", "D101", "D102", "D103", "D104"]
+"examples/*" = ["D101", "D102", "D103"]
+"docs/experiments/*" = ["D103"]
+# Emits the Markdown tables of README.md and docs/reference.md, symbols included.
+"docs/experiments/stability_table.py" = ["D103", "RUF001"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_unused_ignores = true
+ignore_missing_imports = true
+
+# The core is pure NumPy and is held to strict typing.  The backends necessarily cross
+# into third-party APIs that are untyped or typed as Any -- reading a torch tensor,
+# calling into flax.traverse_util -- so the two checks that fire on every such crossing
+# are relaxed there rather than papered over with a cast at each site.
+[[tool.mypy.overrides]]
+module = "anyinit.backends.*"
+warn_return_any = false
+disallow_untyped_calls = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["slow: long-running training regressions"]
+filterwarnings = ["error::DeprecationWarning:anyinit.*"]

@@ -1,0 +1,68 @@
+site_name: AnyInit
+site_description: Initialize any model, in any framework, correctly — with one call.
+site_url: https://jmiravet.github.io/AnyInit/
+repo_url: https://github.com/jmiravet/AnyInit
+repo_name: jmiravet/AnyInit
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  features:
+    - content.code.copy
+    - navigation.sections
+    - navigation.top
+    - search.highlight
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/weather-night
+        name: Dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/weather-sunny
+        name: Light mode
+
+nav:
+  - Home: index.md
+  - Tutorials:
+      - A new activation: tutorials/custom-activation.md
+      - Same weights in every framework: tutorials/multiple-frameworks.md
+      - When initialization decides the outcome: tutorials/depth.md
+      - A ResNet on CIFAR-10: tutorials/resnet.md
+      - A PINN with relu²: tutorials/pinn.md
+  - API: api.md
+  - Reference: reference.md
+  - Design: design.md
+  - Reproducing the measurements: experiments/README.md
+  - Changelog: changelog.md
+
+markdown_extensions:
+  - admonition
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight
+  - pymdownx.superfences
+  - pymdownx.snippets:
+      base_path: ["."]
+      check_paths: true
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: [src]
+          options:
+            docstring_style: google
+            show_root_heading: true
+            show_source: false
+            members_order: source
+            separate_signature: true
+            show_signature_annotations: true
+
+exclude_docs: |
+  requirements.txt
+  experiments/*.py
