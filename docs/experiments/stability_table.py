@@ -1,6 +1,6 @@
 """The chi tables: which activations can hold a signal across depth.
 
-Prints, as Markdown, the stability table in README.md and the moment table in
+Prints, as Markdown, the stability table in docs/guide/stability.md and the moment table in
 docs/reference.md.  tests/test_docs_tables.py checks that both still match this output.
 """
 
@@ -76,7 +76,7 @@ def moment_table() -> list[str]:
 
 
 def main() -> None:
-    print("README.md, stability:\n")
+    print("docs/guide/stability.md, stability:\n")
     print("\n".join(stability_table()))
     print("\ndocs/reference.md, moments:\n")
     print("\n".join(moment_table()))

@@ -25,22 +25,11 @@ middle of their reachable variance range.
 Closed forms for the rectifier powers: `E[relu(x)ⁿ] = ½E[|x|ⁿ]`, so
 `E[relu³] = √(2/π)` and `E[relu³²] = ½E[x⁶] = 7.5`.
 
-`selu` reaching `σ* = 1` exactly is its design property.
+`selu` reaching `σ* = 1` exactly is its design property. Regenerate the table with
+`python docs/experiments/stability_table.py`.
 
-## Stability verdicts
-
-| verdict | condition |
-|---|---|
-| contractive | `χ < 0.98`: errors shrink with depth |
-| marginal | `0.98 ≤ χ ≤ 1.02`: the edge of chaos, errors neither grow nor shrink |
-| expansive | `χ > 1.02`, but `χ^depth ≤ 10`: errors grow, at most tenfold over the network |
-| unstable | `χ^depth > 10`: no scalar initialization holds the signal at this depth |
-| infeasible | the activation cannot reach the target second moment at all |
-
-On its own, an activation is at most *expansive*; *unstable* needs a depth, which the
-report takes from the network.
-
-Regenerate with `python docs/experiments/stability_table.py`.
+The meaning of `χ` and the stability verdicts are in
+[Stability across depth](guide/stability.md).
 
 ## Glossary
 
@@ -58,20 +47,5 @@ Regenerate with `python docs/experiments/stability_table.py`.
 
 ## Further reading
 
-1. Glorot & Bengio (2010). *Understanding the difficulty of training deep feedforward
-   neural networks.* Variance scaling.
-2. He et al. (2015). *Delving Deep into Rectifiers.* The rectifier gain, which falls out of
-   the moment map as the degree-one case.
-3. Poole et al. (2016). *Exponential expressivity in deep neural networks through transient
-   chaos*; Schoenholz et al. (2017). *Deep Information Propagation.* Signal propagation as a
-   dynamical system, and the order parameter the `χ` diagnostic reports.
-4. Mishkin & Matas (2016). *All you need is a good init.* Layer-by-layer rescaling from
-   measurements, which the empirical mode generalizes from a sequence to a graph.
-5. Klambauer et al. (2017). *Self-Normalizing Neural Networks.* Fixed points of the
-   variance map, and the SELU constants the reference table reproduces.
-6. Fernandez-Hernandez et al. (2025). *Sinusoidal Initialization, Time for a New Start.*
-   The `sinusoidal` distribution.
-
-The moment map itself is AnyInit's own: the signal-propagation literature works out the
-recursions analytically for particular activations, and AnyInit instead evaluates them by
-Gaussian quadrature, which is why it accepts an activation it has never seen.
+The papers AnyInit builds on, and what each contributes, are listed under
+[References](index.md#references) on the home page.

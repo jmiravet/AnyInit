@@ -1,4 +1,4 @@
-"""The tables in README.md and docs/reference.md are the output of the code, not copies."""
+"""The tables in the docs are the output of the code, not copies."""
 
 from __future__ import annotations
 
@@ -21,9 +21,9 @@ def tables():
     return module
 
 
-def test_readme_stability_table_matches_the_code(tables):
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    assert "\n".join(tables.stability_table()) in readme
+def test_stability_table_matches_the_code(tables):
+    guide = (ROOT / "docs" / "guide" / "stability.md").read_text(encoding="utf-8")
+    assert "\n".join(tables.stability_table()) in guide
 
 
 def test_reference_moment_table_matches_the_code(tables):

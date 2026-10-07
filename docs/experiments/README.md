@@ -1,7 +1,7 @@
 # Reproducing the measurements
 
-The figures quoted in the README and in `../reference.md` come from these.  They are kept
-out of the test suite because they take minutes rather than seconds.
+The figures quoted in the guide, in `../why.md` and in `../reference.md` come from these.
+They are kept out of the test suite because they take minutes rather than seconds.
 
 | script | what it measures |
 |---|---|

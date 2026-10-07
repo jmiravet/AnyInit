@@ -81,7 +81,7 @@ convention = "google"
 "tests/*" = ["D100", "D101", "D102", "D103", "D104"]
 "examples/*" = ["D101", "D102", "D103"]
 "docs/experiments/*" = ["D103"]
-# Emits the Markdown tables of README.md and docs/reference.md, symbols included.
+# Emits the Markdown tables of docs/guide/stability.md and docs/reference.md, symbols included.
 "docs/experiments/stability_table.py" = ["D103", "RUF001"]
 
 [tool.mypy]

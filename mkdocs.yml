@@ -26,6 +26,13 @@ theme:
 
 nav:
   - Home: index.md
+  - Guide:
+      - Reading the report: guide/report.md
+      - Analytic or empirical: guide/modes.md
+      - Stability across depth: guide/stability.md
+      - Frameworks: guide/frameworks.md
+      - Options: guide/options.md
+      - Why a gain table is not enough: why.md
   - Tutorials:
       - A new activation: tutorials/custom-activation.md
       - Same weights in every framework: tutorials/multiple-frameworks.md
@@ -35,6 +42,7 @@ nav:
   - API: api.md
   - Reference: reference.md
   - Design: design.md
+  - Contributing: contributing.md
   - Reproducing the measurements: experiments/README.md
   - Changelog: changelog.md
 

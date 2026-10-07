@@ -5,7 +5,7 @@ A 20-layer ReLU MLP, initialized over 16 seeds three ways: analytic, analytic wi
 The analytic mode predicts the ensemble; any one draw of a deep, narrow network spreads
 around it, and the spread shrinks with width.
 
-Needs PyTorch.  Quoted in README.md, "Validity".
+Needs PyTorch.  Quoted in docs/guide/modes.md.
 """
 
 from __future__ import annotations

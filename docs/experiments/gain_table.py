@@ -6,7 +6,7 @@ AnyInit's analytic mode and with its empirical mode.  E[a^2] is measured after e
 activation on a fresh batch, independent of the one the empirical mode saw.  Prints the
 mean and standard deviation over five seeds at layers 1, 10 and 20.
 
-Needs PyTorch.  Quoted in README.md, "Why a gain table is not enough".
+Needs PyTorch.  Quoted in docs/why.md.
 """
 
 from __future__ import annotations
