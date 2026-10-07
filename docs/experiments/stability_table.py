@@ -37,6 +37,15 @@ def profile(name: str, fn: Fn) -> ActivationProfile:
     return ActivationProfile(name, fn)
 
 
+def fixed(value: float, digits: int) -> str:
+    """``value`` to ``digits`` decimals, with no sign on a zero.
+
+    A mean that is zero in exact arithmetic comes out of the quadrature as ±1e-17, its sign
+    set by the platform's libm, and would otherwise print as ``-0.0000000`` on some of them.
+    """
+    return f"{round(value, digits) + 0.0:.{digits}f}"
+
+
 def depth_column(chi: float, verdict: str) -> str:
     """Layers before a relative error grows ``DRIFT_LIMIT``-fold."""
     if verdict == "infeasible":
@@ -53,7 +62,7 @@ def stability_table() -> list[str]:
     for name, fn in ROWS:
         diag = profile(name, fn).diagnostics
         depth = depth_column(diag.chi, diag.verdict)
-        lines.append(f"| `{name}` | {diag.chi:.3f} | {diag.verdict} | {depth} |")
+        lines.append(f"| `{name}` | {fixed(diag.chi, 3)} | {diag.verdict} | {depth} |")
     return lines
 
 
@@ -66,11 +75,11 @@ def moment_table() -> list[str]:
         prof = profile(name, fn)
         state = prof.moments(0.0, 1.0)
         diag = prof.diagnostics
-        star = "unreachable" if diag.sigma_star is None else f"{diag.sigma_star:.4f}"
+        star = "unreachable" if diag.sigma_star is None else fixed(diag.sigma_star, 4)
         degree = "—" if diag.homogeneous_degree is None else f"{diag.homogeneous_degree:g}"
         lines.append(
-            f"| `{name}` | {state.mean:.7f} | {state.m2:.7f} | {1.0 / math.sqrt(state.m2):.7f} "
-            f"| {diag.chi:.3f} | {star} | {degree} |"
+            f"| `{name}` | {fixed(state.mean, 7)} | {fixed(state.m2, 7)} "
+            f"| {fixed(1.0 / math.sqrt(state.m2), 7)} | {fixed(diag.chi, 3)} | {star} | {degree} |"
         )
     return lines
 
