@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0
 
 ### Fixed
 
@@ -32,6 +32,9 @@
   backend raised a bare `ValueError`; they now raise `ConfigError`, which subclasses it.
   `gain()` also finds the backend of a registered function that reaches its framework
   through a closure.
+- The moment table in the reference docs failed to match the code on macOS: a mean that
+  is zero in exact arithmetic comes out of the quadrature as ±1e-17, its sign set by the
+  platform's libm, and printed as `-0.0000000`. Zeros are now printed without a sign.
 
 ## 0.1.0
 
