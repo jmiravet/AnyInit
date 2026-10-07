@@ -18,6 +18,7 @@ from typing import Any
 
 import numpy as np
 
+from ..errors import ConfigError
 from . import activations as builtin
 from .activations import Array
 from .profile import ActivationProfile
@@ -89,10 +90,10 @@ class ActivationRegistry:
     ) -> ActivationSpec:
         """Record an activation and discard any profile cached for its name."""
         if numpy_fn is None and native_fn is None:
-            raise ValueError("register needs either numpy_fn or native_fn")
+            raise ConfigError("register needs either numpy_fn or native_fn")
         with self._lock:
             if name in self._specs and not overwrite:
-                raise ValueError(
+                raise ConfigError(
                     f"activation {name!r} is already registered; pass overwrite=True to replace it"
                 )
             spec = ActivationSpec(
@@ -180,7 +181,7 @@ class ActivationRegistry:
             fn: EvalFn = spec.numpy_fn
         else:
             if backend is None:
-                raise ValueError(
+                raise ConfigError(
                     f"activation {spec.name!r} was registered as a native callable, so it needs "
                     "an active backend to evaluate; register a NumPy equivalent to profile it "
                     "without one"

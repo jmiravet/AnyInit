@@ -58,6 +58,7 @@ def run(model: Any, config: InitConfig, params: Any = None) -> InitReport:
         if problem:
             result.warn(problem)
     else:
+        problem = None
         initial = {n.id: analytic.default_scale(graph, n.id) for n in graph.scalable}
         initial.update(fixed)
         weights.apply_all(initial)
@@ -90,6 +91,7 @@ def run(model: Any, config: InitConfig, params: Any = None) -> InitReport:
         input_state=input_state,
         measured_input=measured_input,
         unscaled=unscaled,
+        validation_error=problem,
     )
 
 
@@ -286,7 +288,9 @@ def _build_report(
     input_state: MomentState,
     measured_input: bool,
     unscaled: list[tuple[str, str]],
+    validation_error: str | None,
 ) -> InitReport:
+    upstream = _upstream_draws(graph, plan, result)
     layers: list[LayerRecord] = []
     for node in graph.scalable:
         activation = plan.activation.get(node.id, node.id)
@@ -311,6 +315,7 @@ def _build_report(
                 constrained=point in result.objectives,
                 fixed=node.id in fixed,
                 notes=notes,
+                upstream_draws=upstream.get(node.id, 0.0),
             )
         )
 
@@ -375,7 +380,33 @@ def _build_report(
         objective_error=result.objective_error,
         params=params,
         unscaled=tuple(unscaled),
+        validation_error=validation_error,
     )
+
+
+def _upstream_draws(graph: ModelGraph, plan: Plan, result: SolveResult) -> dict[str, float]:
+    """Relative variance that upstream weight draws add to each scalable layer's level.
+
+    For one input, a layer's draw scales the second moment of its activation's output by
+    a factor whose relative variance is ``(E[a^4]/E[a^2]^2 - 1) / units``: 2/units for a
+    linear layer, 5/units for ReLU.  Those factors multiply along a path, so their
+    variances add, and a normalization starts the count again.  A merge takes its deepest
+    branch.
+    """
+    carried: dict[str, float] = {}
+    upstream: dict[str, float] = {}
+    for nid in graph.order:
+        node = graph[nid]
+        inherited = max((carried[p] for p in graph.predecessors(nid)), default=0.0)
+        if node.kind is NodeKind.NORMALIZATION:
+            inherited = 0.0
+        elif node.is_scalable and node.spec is not None and node.spec.out_units:
+            upstream[nid] = inherited
+            state = result.states.get(_enforced_at(plan, result, nid))
+            kurtosis = state.kurtosis_of_square if state is not None and state.m2 > 0 else 3.0
+            inherited += max(kurtosis - 1.0, 0.0) / node.spec.out_units
+        carried[nid] = inherited
+    return upstream
 
 
 def _activation_label(

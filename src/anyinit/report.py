@@ -41,6 +41,12 @@ class LayerRecord:
     fixed: bool = False
     """Whether the scale came from a user-fixed gain rather than from the solve."""
     notes: tuple[str, ...] = ()
+    upstream_draws: float = 0.0
+    """Relative variance the weight draws of the layers upstream add to this layer's level.
+
+    One draw's deviation from the ensemble compounds with depth, so a layer deep in an
+    unnormalized stack sits further from the prediction than one near the input.
+    """
 
     @property
     def deviation(self) -> float | None:
@@ -53,16 +59,26 @@ class LayerRecord:
     def noise_floor(self) -> float | None:
         """Gap size that sampling alone explains.
 
-        Two terms.  A measured second moment is an average of squares, so batch sampling
-        contributes about ``sqrt(2/n)``.  The usually larger term is that an analytic
-        prediction is an ensemble expectation while the model holds one draw, whose layer
-        statistics deviate by about ``1/sqrt(units)`` however much data is pushed through.
+        A measured second moment is an average of squares, so batch sampling contributes
+        about ``sqrt(2/n)``.  The usually larger term is that an analytic prediction is an
+        ensemble expectation while the model holds one draw, whose layer statistics
+        deviate by about ``1/sqrt(units)`` however much data is pushed through, plus
+        whatever the draws upstream have compounded into its input.  Those factors
+        multiply, so the floor is two standard deviations of the logarithm, and is wider
+        above the prediction than below it.
         """
         if not self.measured_count:
             return None
         batch_term = 2.0 / max(self.measured_count, 1)
-        draw_term = 1.0 / max(self.units or self.measured_count, 1)
-        return 2.0 * math.sqrt(batch_term + draw_term)
+        draw_term = 1.0 / max(self.units or self.measured_count, 1) + self.upstream_draws
+        spread = 2.0 * math.sqrt(batch_term + draw_term)
+        if (
+            self.measured is not None
+            and self.predicted is not None
+            and self.measured < self.predicted
+        ):
+            return -math.expm1(-spread)
+        return math.expm1(spread)
 
     @property
     def excess_deviation(self) -> float | None:
@@ -147,6 +163,8 @@ class InitReport:
     """New parameter tree, for functional backends such as JAX.  ``None`` elsewhere."""
     unscaled: tuple[tuple[str, str], ...] = ()
     """Weights left as the framework initialized them, each with the reason."""
+    validation_error: str | None = None
+    """Why the validation pass that ``input_spec`` asked for could not run."""
 
     # ------------------------------------------------------------- inspection
 
@@ -172,6 +190,8 @@ class InitReport:
         problems = []
         if not self.converged:
             problems.append("the solve did not converge")
+        if self.validation_error:
+            problems.append(self.validation_error)
         deviation = self.max_deviation
         if deviation is not None and deviation > tol:
             worst = self.worst_layer

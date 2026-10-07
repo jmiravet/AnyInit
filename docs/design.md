@@ -38,9 +38,10 @@ translate layouts, read and write parameters, and run forward passes returning
    moments come from.
 5. **Mode purity.** No measurement ever sets an `analytic` scale. The model is run only
    for the validation pass, which runs when `input_spec` is given and whose result
-   reaches the report alone, and, under Flax, for a 16-row probe that identifies
-   activations (below). Shapes come from fake tensors,
-   which carry no data. `empirical` never consults a Gaussian profile to set a scale.
+   reaches the report alone; under Flax, for a 16-row probe that identifies
+   activations (below); and under PyTorch, when the model has adaptive pooling, for a
+   one-row batch of zeros that reads the shapes off. `empirical` never consults a
+   Gaussian profile to set a scale.
 6. **Weights drawn in NumPy.** The same seed gives the same weights under every backend.
 7. **Fail visibly.** Anything AnyInit cannot do correctly goes into the report rather
    than being approximated silently.
@@ -63,7 +64,7 @@ ordinary one, so fans computed on the native shape come out inverted.
 
 | Framework | Mechanism | Fidelity |
 |---|---|---|
-| PyTorch | `torch.fx` symbolic trace; shapes from fake-tensor propagation | graph; falls back to a linear chain from `named_modules` when tracing fails |
+| PyTorch | `torch.fx` symbolic trace; shapes from a one-row probe | graph; falls back to a linear chain from `named_modules` when tracing fails |
 | Keras | `model.operations` and each operation's inbound nodes | graph; linear for an unwired Sequential |
 | Flax | Flax layers and `jax.nn` activations wrapped inside a context manager, then the model applied to a 16-row probe | linear |
 
@@ -71,7 +72,9 @@ PyTorch's `nn.Transformer*` layers are traced as single modules, so the adapter 
 each into its real structure — attention, residual additions, normalizations and the
 feed-forward block — with both `norm_first` layouts. The expanded nodes have no FX node of
 their own and are measured through hooks on the submodules that produce or consume them.
-Adaptive pooling records no window; the fake-tensor shapes supply it.
+Adaptive pooling records no window; a one-row pass of zeros supplies the shapes. Fake
+or meta tensors would avoid running the model, but both load `torch._dynamo` and with it
+Triton, whose native library crashes a process that imported TensorFlow first.
 
 A jaxpr is too far from the source to read activations off: most `jax.nn` functions lower
 to opaque wrappers and a bias add is indistinguishable from a residual one. The

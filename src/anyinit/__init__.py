@@ -245,7 +245,7 @@ def _backend_for(name: str) -> Any:
     spec = REGISTRY.spec(name)
     if spec is None or not spec.needs_backend:
         return None
-    roots = _backends.module_roots(spec.native_type or spec.native_fn)
+    roots = _backends.framework_roots(spec.native_type or spec.native_fn)
     for cls in _backends.installed():
         if cls.frameworks and roots & set(cls.frameworks):
             return _instantiate(cls)

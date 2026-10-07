@@ -267,6 +267,8 @@ class TorchBackend(Backend):
         self._graph_module: Any = None
         self._node_names: dict[str, str] = {}
         self._module_taps: dict[str, tuple[str, Any]] = {}
+        self._device: Any = None
+        self._dtype: Any = None
         self.last_counts: dict[str, int] = {}
 
     @staticmethod
@@ -278,6 +280,12 @@ class TorchBackend(Backend):
             # the Keras adapter, which knows its layouts and fused activations.
             return False
         return "torch" in roots and hasattr(model, "state_dict")
+
+    def begin(self, model: Any, params: Any = None) -> None:
+        """Note where the model lives, so synthesized batches are created to match."""
+        first = next((p for p in model.parameters() if p.is_floating_point()), None)
+        if first is not None:
+            self._device, self._dtype = first.device, first.dtype
 
     # ----------------------------------------------------------------- graph
 
@@ -329,42 +337,49 @@ class TorchBackend(Backend):
         # Nodes expanded out of a container module have no FX node of their own; they are
         # read through hooks on the submodule that produces or consumes them.
         self._module_taps = {n.id: n.meta["tap"] for n in nodes if "tap" in n.meta}
-        nodes = _with_adaptive_windows(
-            nodes, graph_module, self._fake_shapes(graph_module, input_spec)
-        )
+        if any(n.kind is NodeKind.POOL and "adaptive" in n.op.lower() for n in nodes):
+            shapes = self._probe_shapes(graph_module, input_spec)
+            nodes = _with_adaptive_windows(nodes, graph_module, shapes)
         return ModelGraph(nodes, fidelity=FIDELITY_GRAPH, notes=notes)
 
-    def _fake_shapes(self, graph_module: Any, input_spec: Any) -> dict[str, tuple[int, ...]]:
-        """Every FX node's output shape, from fake tensors: no data, no arithmetic.
+    def _probe_shapes(self, graph_module: Any, input_spec: Any) -> dict[str, tuple[int, ...]]:
+        """Every FX node's output shape, from a one-row batch of zeros.
 
         Adaptive pooling needs it, since its window is the input's spatial size, which the
         module does not record.  Best effort: an empty result leaves those windows unknown.
+
+        A real pass rather than fake or meta tensors: both route operators through
+        ``torch._dynamo`` and with it Triton, whose native library crashes the process when
+        TensorFlow was loaded first.  Run only when the model has an adaptive pool.
         """
         torch = self._torch
-        try:
-            from torch._subclasses.fake_tensor import FakeTensorMode
-            from torch.fx.passes.fake_tensor_prop import FakeTensorProp
+        from torch import fx
 
+        shapes: dict[str, tuple[int, ...]] = {}
+
+        class ShapeRecorder(fx.Interpreter):
+            def run_node(self, n: Any) -> Any:
+                out = super().run_node(n)
+                if isinstance(out, torch.Tensor):
+                    shapes[n.name] = tuple(out.shape)
+                return out
+
+        try:
             specs = input_spec if isinstance(input_spec, list) else [input_spec]
-            mode = FakeTensorMode(allow_non_fake_inputs=True)
             args = []
             for spec in specs:
                 if isinstance(spec, torch.Tensor):
-                    args.append(mode.from_tensor(spec))
-                elif isinstance(spec, tuple) and all(isinstance(d, int) for d in spec):
-                    args.append(mode.from_tensor(torch.empty(spec)))
+                    args.append(torch.zeros_like(spec[:1], device=self._device))
+                elif isinstance(spec, tuple) and spec and all(isinstance(d, int) for d in spec):
+                    args.append(torch.zeros((1, *spec[1:]), dtype=self._dtype, device=self._device))
                 else:
                     return {}
             # Eval mode: a training-mode pass would count a batch on every BatchNorm.
-            with _preserved_running_stats(graph_module, training=False):
-                FakeTensorProp(graph_module, mode).propagate(*args)
+            with _preserved_running_stats(graph_module, training=False), torch.no_grad():
+                _quiet(ShapeRecorder(graph_module)).run(*args)
         except Exception:
             return {}
-        return {
-            n.name: tuple(n.meta["val"].shape)
-            for n in graph_module.graph.nodes
-            if isinstance(n.meta.get("val"), torch.Tensor)
-        }
+        return shapes
 
     def _classify(
         self,
@@ -883,7 +898,7 @@ class TorchBackend(Backend):
         handles = self._tap_hooks(wanted, record)
         try:
             with _preserved_running_stats(model, training), torch.no_grad():
-                Recorder(self._graph_module).run(*batch)
+                _quiet(Recorder(self._graph_module)).run(*batch)
         except _AllRecordedError:
             pass
         finally:
@@ -959,10 +974,12 @@ class TorchBackend(Backend):
         if callable(input_spec) and not isinstance(input_spec, (tuple, list)):
             return input_spec()
         if isinstance(input_spec, torch.Tensor):
-            return input_spec
+            return input_spec if self._device is None else input_spec.to(self._device)
         if isinstance(input_spec, (tuple, list)) and all(isinstance(d, int) for d in input_spec):
+            # Drawn on the CPU, so the batch is the same whatever device the model is on.
             generator = torch.Generator().manual_seed(0 if seed is None else int(seed))
-            return torch.randn(tuple(input_spec), generator=generator)
+            batch = torch.randn(tuple(input_spec), generator=generator)
+            return batch if self._device is None else batch.to(self._device, self._dtype)
         return input_spec
 
 
@@ -1017,6 +1034,17 @@ def _with_adaptive_windows(
                 node = node.with_meta(window=max(int(window), 1))
         out.append(node)
     return out
+
+
+def _quiet(interpreter: Any) -> Any:
+    """Keep an interpreter from logging the exceptions that pass through it.
+
+    The early stop in :meth:`TorchBackend.forward_taps` is an exception, and the logging
+    path imports ``torch._inductor`` and with it Triton, whose native library crashes the
+    process when TensorFlow was loaded first.
+    """
+    interpreter.extra_traceback = False
+    return interpreter
 
 
 class _AllRecordedError(Exception):

@@ -36,7 +36,7 @@ from ..core.graph import FIDELITY_LINEAR, ModelGraph, Node, NodeKind
 from ..core.moments import MomentState
 from ..core.registry import REGISTRY, ActivationRef
 from ..errors import TraceError
-from .base import Backend, TapRecorder, module_roots
+from .base import Backend, TapRecorder, input_rng, module_roots
 
 #: Flax layer class -> (ParamSpec kind, parameter name).
 _LAYERS: dict[str, tuple[str, str]] = {
@@ -118,6 +118,8 @@ class FlaxBackend(Backend):
         self._collections: dict[str, Any] = {}
         self._trace: list[tuple[int, str, str, tuple[str, ...]]] = []
         self._inferred: dict[int, str] = {}
+        self._superseded: set[int] = set()
+        self._output_leaf: int | None = None
         self.last_counts: dict[str, int] = {}
 
     @staticmethod
@@ -165,10 +167,13 @@ class FlaxBackend(Backend):
         probe = self._probe(dummy)
         inputs: dict[int, np.ndarray] = {}
         outputs: dict[int, np.ndarray] = {}
-        with _instrumented(
-            observe=lambda i, v: outputs.__setitem__(i, np.asarray(v)),
-            observe_input=lambda i, v: inputs.__setitem__(i, np.asarray(v)),
-        ) as trace:
+        with (
+            self._probe_weights(),
+            _instrumented(
+                observe=lambda i, v: outputs.__setitem__(i, np.asarray(v)),
+                observe_input=lambda i, v: inputs.__setitem__(i, np.asarray(v)),
+            ) as trace,
+        ):
             final = _first(self._apply(model, probe))
         self._trace = list(trace)
         if not self._trace:
@@ -177,10 +182,33 @@ class FlaxBackend(Backend):
                 "flax.linen layers and jax.nn activations; a model built from raw jnp "
                 "operations is invisible to it"
             )
-        if final is not None and self._trace:
-            inputs[_MODEL_OUTPUT] = np.asarray(final)
-        self._inferred, notes = self._infer_activations(inputs, outputs)
+        leaves = [np.asarray(leaf) for leaf in self._jax.tree.leaves(final)]
+        self._inferred, notes = self._infer_activations(inputs, outputs, leaves)
         return self._graph_from_trace(notes)
+
+    @contextlib.contextmanager
+    def _probe_weights(self) -> Iterator[None]:
+        """Trace with unit-scale weights in place of the ones the model came with.
+
+        Activations are read off the probe's values, and the incoming weights may shrink
+        the signal below anything a comparison can resolve -- ``normal(0.02)`` leaves
+        about 1e-7 after ten layers -- or saturate it.  Weights drawn with variance
+        ``1/fan_in`` and zero biases are close to what AnyInit is about to write.
+        """
+        original = self._flat
+        rng = np.random.default_rng(0)
+        provisional = dict(original)
+        for path, value in original.items():
+            if path[-1] in _WEIGHT_NAMES and value.ndim >= 2:
+                fan = 1 if path[-1] == "embedding" else int(np.prod(value.shape[:-1]))
+                provisional[path] = rng.standard_normal(value.shape) / np.sqrt(max(fan, 1))
+            elif path[-1] == "bias" and (*path[:-1], "kernel") in original:
+                provisional[path] = np.zeros(value.shape)
+        self._flat = provisional
+        try:
+            yield
+        finally:
+            self._flat = original
 
     def _probe(self, batch: Any) -> Any:
         """A few rows of the input, enough to read activations off their values."""
@@ -192,48 +220,81 @@ class FlaxBackend(Backend):
         return model.apply(self._pytree(), batch, **({"mutable": mutable} if mutable else {}))
 
     def _infer_activations(
-        self, inputs: dict[int, np.ndarray], outputs: dict[int, np.ndarray]
+        self,
+        inputs: dict[int, np.ndarray],
+        outputs: dict[int, np.ndarray],
+        final: Sequence[np.ndarray] = (),
     ) -> tuple[dict[int, str], list[str]]:
         """Identify activations applied between consecutive layers, by their values.
 
         Instrumenting ``jax.nn`` only sees calls made through that namespace.  The usual
         Flax idioms -- an activation stored as a module field, captured in a closure, or
         written as a lambda -- call the function object directly and are never seen.  So
-        every pair of consecutive layers with nothing recorded between them is checked:
-        if the second layer's input is a known activation applied elementwise to the first
-        layer's output, that activation is inserted.  Returns the activations found, keyed
-        by the trace index of the layer they feed, and notes for anything unidentifiable.
+        every pair of consecutive layers is checked: if the second layer's input is not
+        what the first layer's output became through the activations recorded between
+        them, the transform is matched against the known and registered activations, and
+        what it identifies takes the place of what was recorded.  A registered function
+        that calls ``jnp.tanh`` inside is caught this way, rather than taken for ``tanh``.
+
+        ``final`` holds the leaves of the model's output, which stands in for a layer after
+        the last one, so an activation applied last is caught too.  Returns the
+        activations found, keyed by the trace index of the layer they feed, and notes for
+        anything unidentifiable.
         """
         found: dict[int, str] = {}
         notes: list[str] = []
+        self._superseded = set()
+        self._output_leaf = None
         layers = [entry for entry in self._trace if entry[1] in ("layer", "norm")]
-        if _MODEL_OUTPUT in inputs:
-            # The model's own output stands in for a layer after the last one, so an
-            # activation applied last is caught too.
+        if final:
             layers.append((_MODEL_OUTPUT, "output", "output", ()))
-        recorded = {entry[0] for entry in self._trace if entry[1] == "activation"}
+        recorded = [entry[0] for entry in self._trace if entry[1] == "activation"]
         for previous, current in itertools.pairwise(layers):
             upper = current[0] if current[0] != _MODEL_OUTPUT else float("inf")
-            if any(previous[0] < index < upper for index in recorded):
+            between = [index for index in recorded if previous[0] < index < upper]
+            z = outputs.get(previous[0])
+            if z is None:
                 continue
-            z, x = outputs.get(previous[0]), inputs.get(current[0])
-            if z is None or x is None:
-                continue
-            if z.shape != x.shape:
+            if current[0] == _MODEL_OUTPUT:
+                # A model returning several arrays is matched leaf by leaf, latest first.
+                candidates = list(enumerate(final))[::-1]
+            else:
+                candidates = [(0, inputs[current[0]])] if current[0] in inputs else []
+            last = outputs.get(between[-1]) if between else None
+            seen = False
+            for leaf, x in candidates:
                 if z.size != x.size:
                     continue  # pooling, slicing or a merge: not an elementwise step
+                seen = True
                 x = x.reshape(z.shape)
-            if _close(z, x):
-                continue  # genuinely linear between the two layers
-            name = self._identify(z, x)
-            if name is not None:
-                found[current[0]] = name
+                if last is not None and (last.size != x.size or _close(last.reshape(x.shape), x)):
+                    verdict: str | None = ""  # the recorded activations account for it
+                elif last is None and _close(z, x):
+                    verdict = ""  # genuinely linear between the two layers
+                else:
+                    verdict = self._identify(z, x)
+                if verdict is None:
+                    continue
+                if current[0] == _MODEL_OUTPUT:
+                    self._output_leaf = leaf
+                if verdict:
+                    found[current[0]] = verdict
+                    self._superseded.update(between)
+                break
             else:
-                notes.append(
-                    f"between {'/'.join(previous[3]) or previous[2]} and "
-                    f"{'/'.join(current[3]) or current[2]} the signal is transformed by "
-                    "something AnyInit could not identify; treated as linear"
-                )
+                if seen:
+                    where = (
+                        f"between {'/'.join(previous[3]) or previous[2]} and "
+                        f"{'/'.join(current[3]) or current[2]}"
+                    )
+                    notes.append(
+                        f"{where} the signal is transformed by something AnyInit could not "
+                        + (
+                            "identify, beyond the activations it saw called; scaled for those"
+                            if between
+                            else "identify; treated as linear"
+                        )
+                    )
         return found, notes
 
     def _try_native(self, fn: Any, z: np.ndarray) -> np.ndarray:
@@ -255,7 +316,15 @@ class FlaxBackend(Backend):
                 return name
         for name in REGISTRY.custom_names:
             spec = REGISTRY.spec(name)
-            if spec is not None and spec.numpy_fn is not None and _close(spec.numpy_fn(z64), x):
+            if spec is None:
+                continue
+            if spec.numpy_fn is not None:
+                candidate = spec.numpy_fn(z64)
+            elif spec.native_type is None and callable(spec.native_fn):
+                candidate = self._try_native(spec.native_fn, z)
+            else:
+                continue
+            if _close(candidate, x):
                 return name
         return None
 
@@ -264,6 +333,8 @@ class FlaxBackend(Backend):
         previous = "input"
 
         for index, kind, op, path in self._trace:
+            if index in self._superseded:
+                continue
             inferred = self._inferred.get(index)
             if inferred is not None:
                 nodes.append(
@@ -447,7 +518,8 @@ class FlaxBackend(Backend):
         ):
             final = _first(self._apply(model, self._jnp.asarray(inputs), training))
             self._jax.block_until_ready(final)
-        record(input_to_id, _MODEL_OUTPUT, final)
+        if self._output_leaf is not None:
+            record(input_to_id, _MODEL_OUTPUT, self._jax.tree.leaves(final)[self._output_leaf])
         self.last_counts = recorder.counts()
         return recorder.result()
 
@@ -482,7 +554,7 @@ class FlaxBackend(Backend):
         if callable(input_spec) and not isinstance(input_spec, (tuple, list)):
             return input_spec()
         if isinstance(input_spec, (tuple, list)) and all(isinstance(d, int) for d in input_spec):
-            rng = np.random.default_rng(0 if seed is None else int(seed))
+            rng = input_rng(seed)
             return self._jnp.asarray(
                 rng.standard_normal(tuple(input_spec)), dtype=self._jnp.float32
             )
@@ -506,6 +578,9 @@ def _instrumented(
 
     trace: list[tuple[int, str, str, tuple[str, ...]]] = []
     counter = [0]
+    # Activations under way.  One activation calling another -- a registered function
+    # built on jnp.tanh, or jax.nn.gelu on tanh -- is a single step, recorded once.
+    depth = [0]
     saved: list[tuple[Any, str, Any]] = []
 
     def record(kind: str, op: str, path: tuple[str, ...]) -> int:
@@ -519,12 +594,20 @@ def _instrumented(
         saved.append((cls, "__call__", original))
 
         def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
+            if depth[0]:
+                return original(self, *args, **kwargs)
             scope = getattr(self, "scope", None)
             path = tuple(str(p) for p in scope.path) if scope is not None else ()
             index = record(kind, op, path)
             if observe_input is not None and args:
                 observe_input(index, args[0])
-            out = original(self, *args, **kwargs)
+            if kind == "activation":
+                depth[0] += 1
+            try:
+                out = original(self, *args, **kwargs)
+            finally:
+                if kind == "activation":
+                    depth[0] -= 1
             if observe is not None:
                 observe(index, out)
             return out
@@ -538,8 +621,14 @@ def _instrumented(
         saved.append((holder, attr, original))
 
         def wrapper(*args: Any, **kwargs: Any) -> Any:
+            if depth[0]:
+                return original(*args, **kwargs)
             index = record("activation", attr, ())
-            out = original(*args, **kwargs)
+            depth[0] += 1
+            try:
+                out = original(*args, **kwargs)
+            finally:
+                depth[0] -= 1
             if observe is not None:
                 observe(index, out)
             return out
@@ -598,6 +687,9 @@ _IDENTIFIABLE: tuple[str, ...] = (
 #: Trace key standing for the model's output, so a final activation can be identified.
 _MODEL_OUTPUT = -1
 
+#: Parameter names of the weights the layers in ``_LAYERS`` own.
+_WEIGHT_NAMES = frozenset(name for _, name in _LAYERS.values())
+
 
 def _inferred_id(name: str, index: int) -> str:
     """Node id of an activation identified from values, by the layer it feeds."""
@@ -612,12 +704,16 @@ def _first(result: Any) -> Any:
 
 
 def _close(a: np.ndarray, b: np.ndarray) -> bool:
-    """Equality to float32 working precision, scaled by the magnitude of the values."""
+    """Equality to float32 working precision, relative to the magnitude of the values.
+
+    Purely relative, so that a faint signal is compared as finely as a strong one: with an
+    absolute floor, ``relu(z)`` and ``z`` agree once ``z`` is small enough.
+    """
     a = np.asarray(a, dtype=np.float64)
     b = np.asarray(b, dtype=np.float64)
     if a.shape != b.shape:
         return False
-    scale = max(float(np.abs(b).max(initial=0.0)), 1.0)
+    scale = float(np.abs(b).max(initial=0.0))
     return bool(np.allclose(a, b, rtol=1e-5, atol=1e-6 * scale))
 
 

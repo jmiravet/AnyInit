@@ -72,7 +72,7 @@ Stability
 targeted the middle of its reachable variance range instead
 
 Validation
-  largest unexplained prediction/measurement gap: 41.78% at bn  [CHECK]  (raw gap 60.00%, \
+  largest unexplained prediction/measurement gap: 40.01% at bn  [CHECK]  (raw gap 60.00%, \
 the rest is sampling noise)
   the prediction is the ensemble average and this model is one draw of it, which drifts \
 further from it with depth; center=True removes most of it, mode='empirical' all of it
@@ -100,7 +100,7 @@ MARKDOWN = """\
 targeted the middle of its reachable variance range instead
 
 ### Validation
-- largest unexplained prediction/measurement gap: 41.78% at bn  [CHECK]  (raw gap 60.00%, \
+- largest unexplained prediction/measurement gap: 40.01% at bn  [CHECK]  (raw gap 60.00%, \
 the rest is sampling noise)
 - the prediction is the ensemble average and this model is one draw of it, which drifts \
 further from it with depth; center=True removes most of it, mode='empirical' all of it
@@ -173,3 +173,32 @@ def test_stability_advice(verdict, chi, expected):
     else:
         assert advice is not None
         assert expected in advice
+
+
+def test_skipped_validation_is_not_healthy():
+    report = _report(validation_error="validation skipped: RuntimeError: device mismatch")
+    with pytest.raises(AssertionError, match="device mismatch"):
+        report.assert_healthy(tol=1.0)
+
+
+def test_noise_floor_widens_with_upstream_draws():
+    shallow = LayerRecord(
+        "a", "Linear", predicted=1.0, measured=1.5, measured_count=4096, units=256
+    )
+    deep = LayerRecord(
+        "b",
+        "Linear",
+        predicted=1.0,
+        measured=1.5,
+        measured_count=4096,
+        units=256,
+        upstream_draws=29 * 5 / 256,
+    )
+    assert shallow.excess_deviation > 0.3
+    assert deep.excess_deviation == 0.0
+
+
+def test_noise_floor_is_symmetric_in_log_scale():
+    above = LayerRecord("a", "Linear", predicted=1.0, measured=2.0, measured_count=10**6, units=4)
+    below = LayerRecord("a", "Linear", predicted=1.0, measured=0.5, measured_count=10**6, units=4)
+    assert math.log1p(above.noise_floor) == pytest.approx(-math.log1p(-below.noise_floor))

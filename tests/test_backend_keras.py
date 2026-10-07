@@ -151,3 +151,15 @@ def test_sequential_model_is_initialized():
     assert report.converged
     assert len(report.layers) == 4
     report.assert_healthy(tol=0.2)
+
+
+def test_validation_batch_is_independent_of_the_weights():
+    width = 512
+    model = keras.Sequential(
+        [keras.Input((width,))] + [layers.Dense(width, activation="relu") for _ in range(2)]
+    )
+    report = anyinit.initialize(model, input_spec=(64, width), seed=0)
+    kernel = keras.ops.convert_to_numpy(model.layers[0].kernel).astype(np.float64)
+    x = np.random.default_rng(12345).standard_normal((4096, width))
+    independent = float(np.mean(np.maximum(x @ kernel, 0) ** 2))
+    assert report.layers[0].measured == pytest.approx(independent, abs=0.05)

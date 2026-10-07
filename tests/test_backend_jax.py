@@ -223,3 +223,54 @@ def test_model_with_no_recognised_layers_is_reported():
 
     with pytest.raises(TraceError, match="invisible"):
         anyinit.initialize(Raw(), input_spec=(4, 8), seed=0)
+
+
+def test_registered_activation_built_on_tanh_is_not_taken_for_tanh():
+    @anyinit.register_activation(name="t_jax_softclip")
+    def softclip(x):
+        return jnp.tanh(x) * 2.0
+
+    class Net(nn.Module):
+        @nn.compact
+        def __call__(self, x):
+            for _ in range(4):
+                x = softclip(nn.Dense(64)(x))
+            return nn.Dense(1)(x)
+
+    try:
+        model = Net()
+        params = model.init(jax.random.key(0), jnp.ones((1, 64)))
+        x = jnp.asarray(np.random.default_rng(99).standard_normal((512, 64)), dtype=jnp.float32)
+        _, report = anyinit.initialize_params(model, params, x, seed=0)
+        assert [r.activation for r in report.layers] == ["t_jax_softclip"] * 4 + ["none"]
+        report.assert_healthy(tol=0.3)
+    finally:
+        anyinit.unregister_activation("t_jax_softclip")
+
+
+class _FieldMLP(nn.Module):
+    small_init: bool = False
+    intermediates: bool = False
+    act: object = nn.relu
+
+    @nn.compact
+    def __call__(self, x):
+        kw = {"kernel_init": nn.initializers.normal(0.02)} if self.small_init else {}
+        hs = []
+        for _ in range(30):
+            x = self.act(nn.Dense(128, **kw)(x))
+            hs.append(x)
+        return hs if self.intermediates else x
+
+
+@pytest.mark.parametrize(
+    ("small_init", "intermediates"), [(True, False), (False, True), (True, True)]
+)
+def test_field_activation_is_identified_whatever_the_incoming_weights_and_output(
+    small_init, intermediates
+):
+    model = _FieldMLP(small_init=small_init, intermediates=intermediates)
+    x = jnp.asarray(np.random.default_rng(99).standard_normal((256, 128)), dtype=jnp.float32)
+    params = model.init(jax.random.key(0), x[:1])
+    _, report = anyinit.initialize_params(model, params, x, seed=0)
+    assert [r.activation for r in report.layers] == ["relu"] * 30

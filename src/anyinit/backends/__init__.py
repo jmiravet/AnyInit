@@ -12,7 +12,7 @@ import importlib
 from typing import Any
 
 from ..errors import BackendNotFoundError, BackendUnavailableError
-from .base import Backend, TapRecorder, module_roots
+from .base import Backend, TapRecorder, framework_roots, module_roots
 
 #: Known backends in detection order, most specific first.  Keras precedes PyTorch
 #: because Keras 3 on its torch backend builds layers that subclass ``nn.Module``; the
@@ -85,4 +85,12 @@ def _not_found_message(model: Any) -> str:
     )
 
 
-__all__ = ["Backend", "TapRecorder", "installed", "known", "module_roots", "resolve"]
+__all__ = [
+    "Backend",
+    "TapRecorder",
+    "framework_roots",
+    "installed",
+    "known",
+    "module_roots",
+    "resolve",
+]

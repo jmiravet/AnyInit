@@ -10,8 +10,10 @@ holds a framework object and so never reaches for a framework operation.
 
 from __future__ import annotations
 
+import contextlib
 import importlib
 import importlib.util
+import inspect
 import sys
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
@@ -48,22 +50,37 @@ def framework_roots(obj: Any) -> set[str]:
     """Top-level packages a registered activation is written against.
 
     A class or instance answers through its hierarchy.  A plain function has no telling
-    hierarchy, so the globals its code refers to are inspected instead: ``torch.relu(x)``
-    names ``torch``, ``jax.nn.relu(x)`` names ``jax``.
+    hierarchy, so the globals and closure variables its code refers to are inspected
+    instead: ``torch.relu(x)`` names ``torch``, ``jax.nn.relu(x)`` names ``jax``.
     """
     roots = set(module_roots(obj))
     code = getattr(obj, "__code__", None)
     namespace = getattr(obj, "__globals__", None)
-    if code is not None and isinstance(namespace, dict):
-        for name in code.co_names:
-            target = namespace.get(name)
-            if target is None:
-                continue
-            module = getattr(target, "__name__", None) if isinstance(target, type(sys)) else None
-            module = module or getattr(target, "__module__", None) or ""
-            if module:
-                roots.add(module.split(".")[0])
+    if code is None or not isinstance(namespace, dict):
+        return roots
+    targets = [namespace.get(name) for name in code.co_names]
+    # A function defined inside another reaches its framework through a closure cell.
+    with contextlib.suppress(TypeError, ValueError):
+        targets.extend(inspect.getclosurevars(obj).nonlocals.values())
+    for target in targets:
+        if target is None:
+            continue
+        module = getattr(target, "__name__", None) if isinstance(target, type(sys)) else None
+        module = module or getattr(target, "__module__", None) or ""
+        if isinstance(module, str) and module:
+            roots.add(module.split(".")[0])
     return roots
+
+
+def input_rng(seed: int | None) -> np.random.Generator:
+    """Generator for a synthesized input batch.
+
+    Weights draw from ``default_rng([seed, layer_index])``, and NumPy pads an entropy list
+    with zeros, so ``default_rng(seed)`` would replay the first layer's weights as the
+    input.  A spawn key keeps this stream apart from every layer's.
+    """
+    entropy = 0 if seed is None else int(seed)
+    return np.random.default_rng(np.random.SeedSequence(entropy, spawn_key=(1,)))
 
 
 class Backend(ABC):

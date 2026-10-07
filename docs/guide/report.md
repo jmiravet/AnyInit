@@ -39,6 +39,14 @@ The validation line compares the prediction with one measured forward pass and r
 gap beyond sampling noise. It is a sanity check, never used to pick a scale. It runs when
 you pass an `input_spec`.
 
+The noise allowed for includes the weight draw itself: the prediction is an ensemble
+average and the model is one draw of it, and in an unnormalized stack the deviations of
+successive layers compound, so a layer deep in a plain ReLU MLP may legitimately sit tens
+of percent away from the prediction. A normalization layer starts the count again.
+
+If the validation pass was requested but could not run, the reason is listed under
+warnings and `assert_healthy()` fails, since nothing was checked.
+
 ## Warnings
 
 Anything AnyInit could not do correctly is listed: weights it left untouched (recurrent,

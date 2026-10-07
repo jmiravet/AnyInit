@@ -69,3 +69,23 @@ def test_decorator_form_with_arguments_registers_under_the_given_name():
 def test_invalid_options_raise_before_the_model_is_touched(options):
     with pytest.raises(ConfigError):
         anyinit.initialize(object(), input_spec=(2, 2), **options)
+
+
+def test_duplicate_registration_raises_config_error():
+    anyinit.register_activation(lambda x: np.abs(x), name="t_err_dup")
+    try:
+        with pytest.raises(ConfigError, match="already registered"):
+            anyinit.register_activation(lambda x: np.abs(x), name="t_err_dup")
+    finally:
+        anyinit.unregister_activation("t_err_dup")
+
+
+def test_native_activation_without_a_backend_raises_config_error():
+    from anyinit.core.registry import REGISTRY, ActivationRef
+
+    REGISTRY.register("t_err_native", native_fn=lambda x: x)
+    try:
+        with pytest.raises(ConfigError, match="needs an active backend"):
+            REGISTRY.profile(ActivationRef("t_err_native"))
+    finally:
+        anyinit.unregister_activation("t_err_native")

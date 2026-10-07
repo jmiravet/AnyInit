@@ -22,7 +22,7 @@ from ..core import fan as fanmod
 from ..core.graph import FIDELITY_GRAPH, FIDELITY_LINEAR, ModelGraph, Node, NodeKind
 from ..core.moments import MomentState
 from ..core.registry import ActivationRef
-from .base import Backend, TapRecorder, module_roots
+from .base import Backend, TapRecorder, input_rng, module_roots
 
 _NORM_CLASSES = frozenset(
     {
@@ -512,7 +512,7 @@ class KerasBackend(Backend):
         if callable(input_spec) and not isinstance(input_spec, (tuple, list)):
             return input_spec()
         if isinstance(input_spec, (tuple, list)) and all(isinstance(d, int) for d in input_spec):
-            rng = np.random.default_rng(0 if seed is None else int(seed))
+            rng = input_rng(seed)
             return rng.standard_normal(tuple(input_spec)).astype(np.float32)
         return input_spec
 

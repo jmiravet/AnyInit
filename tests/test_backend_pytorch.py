@@ -204,3 +204,40 @@ def _wrap(layer):
             return self.inner(x)
 
     return Wrapper()
+
+
+def test_deep_relu_stack_is_healthy():
+    """One draw of a deep stack wanders from the ensemble prediction; that is not a fault."""
+    model = nn.Sequential(*[m for _ in range(30) for m in (nn.Linear(256, 256), nn.ReLU())])
+    report = anyinit.initialize(model, input_spec=(64, 256), seed=0)
+    report.assert_healthy()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_model_on_cuda_is_validated():
+    model = nn.Sequential(nn.Linear(64, 64), nn.ReLU(), nn.Linear(64, 10)).cuda()
+    report = anyinit.initialize(model, input_spec=(32, 64), seed=0)
+    assert not report.warnings, report.warnings
+    assert all(r.measured is not None for r in report.layers)
+
+
+def test_validation_batch_follows_the_model_dtype():
+    model = nn.Sequential(nn.Linear(16, 16), nn.ReLU()).double()
+    report = anyinit.initialize(model, input_spec=(32, 16), seed=0)
+    assert not report.warnings, report.warnings
+    assert report.layers[0].measured is not None
+
+
+def test_initializing_does_not_load_dynamo():
+    """torch._dynamo pulls in Triton, which crashes a process that loaded TensorFlow first."""
+    import subprocess
+    import sys
+
+    code = (
+        "import sys, torch, anyinit; from torch import nn; "
+        "m = nn.Sequential(nn.Conv2d(3, 4, 3), nn.ReLU(), nn.AdaptiveAvgPool2d(2)); "
+        "anyinit.initialize(m, input_spec=(2, 3, 8, 8)); "
+        "assert 'torch._dynamo' not in sys.modules"
+    )
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
