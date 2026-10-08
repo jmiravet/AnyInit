@@ -7,7 +7,9 @@ No single scale serves both.
 
 The output role decides.  At the lookup's scale the logits' standard deviation is
 ``sqrt(d_model)`` and the initial loss grows with width; at the output's scale the lookup
-merely enters the network small.  The table is held at that scale through the solve, so
+merely enters the network small.  Constant factors the model applies around the output
+layer count, so a model that scales its logits by ``1/sqrt(d_model)`` gets a table of
+scale 1, which serves both roles.  The table is held at its scale through the solve, so
 everything downstream is solved for what the lookup really delivers, and the report says
 what the lookup was left with.  The measurements behind this are in :data:`DOCS`.
 
@@ -17,7 +19,7 @@ Backends mark every node that reads a tied table with the same ``meta["tied"]`` 
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from .fan import EMBEDDING, fan_in
@@ -34,11 +36,20 @@ class TiedTable:
     outputs: tuple[str, ...]
     width: int
     """The table's ``d_model``: the fan_in of its output role."""
+    output_factor: float = 1.0
+    """Constant factor the model applies around the output layer, on either side of it."""
+    lookup_factor: float = 1.0
+    """Constant factor the model applies to the looked-up rows."""
 
     @property
     def scale(self) -> float:
         """The output role's scale, which the table takes."""
-        return 1.0 / math.sqrt(self.width)
+        return 1.0 / (self.output_factor * math.sqrt(self.width))
+
+    @property
+    def lookup_m2(self) -> float:
+        """``E[x^2]`` of the looked-up rows, after the model's factor."""
+        return (self.lookup_factor * self.scale) ** 2
 
 
 def find(graph: ModelGraph) -> tuple[TiedTable, ...]:
@@ -54,8 +65,19 @@ def find(graph: ModelGraph) -> tuple[TiedTable, ...]:
         lookups = tuple(n.id for n in nodes if n.spec is not None and n.spec.kind == EMBEDDING)
         outputs = [n for n in nodes if n.spec is not None and n.spec.is_fan_scaled]
         if lookups and outputs and outputs[0].spec is not None:
-            width = int(fan_in(outputs[0].spec))
-            tables.append(TiedTable(lookups, tuple(n.id for n in outputs), width))
+            readout = outputs[0].id
+            output_factor = _factor(graph, readout, graph.successors) * _factor(
+                graph, readout, graph.predecessors
+            )
+            tables.append(
+                TiedTable(
+                    lookups,
+                    tuple(n.id for n in outputs),
+                    int(fan_in(outputs[0].spec)),
+                    output_factor if output_factor > 0.0 else 1.0,
+                    _factor(graph, lookups[0], graph.successors),
+                )
+            )
     return tuple(tables)
 
 
@@ -65,20 +87,31 @@ def scales(tables: Sequence[TiedTable]) -> dict[str, float]:
 
 
 def describe(table: TiedTable, graph: ModelGraph) -> str:
-    """What was decided for one table, and why, for the report."""
-    names = ", ".join(_name(graph, nid) for nid in table.lookups)
-    outputs = ", ".join(_name(graph, nid) for nid in table.outputs)
-    d = table.width
+    """One line for the report: what the table got and what the lookup delivers."""
+    names = ", ".join(_name(graph, nid) for nid in table.lookups + table.outputs)
     return (
-        f"tied embedding: {names} is also the output layer {outputs}. As an output it "
-        f"needs 1/sqrt({d}) = {table.scale:.4g} for unit-variance logits, as a lookup it "
-        f"would take 1; it was given the output's scale, so looked-up rows have "
-        f"E[x^2] = {table.scale**2:.3g}. Unless forward() already multiplies them by "
-        f"sqrt({d}), as Gemma and the original Transformer do, doing so restores unit "
-        f"variance without touching the logits. {DOCS} covers this and the table's "
-        "learning rate"
+        f"tied embedding ({names}): scaled for the output layer ({table.scale:.4g}), so "
+        f"the lookup delivers E[x^2] = {table.lookup_m2:.3g}; see {DOCS}"
     )
 
 
 def _name(graph: ModelGraph, node_id: str) -> str:
     return str(graph[node_id].meta.get("path") or node_id)
+
+
+def _factor(graph: ModelGraph, start: str, step: Callable[[str], tuple[str, ...]]) -> float:
+    """Product of the constant factors met walking from ``start`` along a single path.
+
+    Reshapes are passed through; anything else, or a branch, ends the walk.  A factor that
+    comes with an offset is not a pure scaling and ends it too.
+    """
+    factor = 1.0
+    current = start
+    while len(step(current)) == 1:
+        node = graph[step(current)[0]]
+        if node.kind is NodeKind.SCALE and not node.meta.get("offset"):
+            factor *= math.sqrt(node.meta["factor"].m2)
+        elif node.kind is not NodeKind.SHAPE:
+            break
+        current = node.id
+    return factor

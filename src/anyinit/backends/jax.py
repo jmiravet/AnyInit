@@ -119,6 +119,7 @@ class FlaxBackend(Backend):
         self._trace: list[tuple[int, str, str, tuple[str, ...]]] = []
         self._inferred: dict[int, str] = {}
         self._superseded: set[int] = set()
+        self._scales: dict[int, float] = {}
         self._output_leaf: int | None = None
         self.last_counts: dict[str, int] = {}
 
@@ -235,6 +236,8 @@ class FlaxBackend(Backend):
         them, the transform is matched against the known and registered activations, and
         what it identifies takes the place of what was recorded.  A registered function
         that calls ``jnp.tanh`` inside is caught this way, rather than taken for ``tanh``.
+        A transform that matches no activation is tried as a constant factor, such as the
+        ``sqrt(d_model)`` a language model multiplies its lookup by, kept in ``_scales``.
 
         ``final`` holds the leaves of the model's output, which stands in for a layer after
         the last one, so an activation applied last is caught too.  Returns the
@@ -244,6 +247,7 @@ class FlaxBackend(Backend):
         found: dict[int, str] = {}
         notes: list[str] = []
         self._superseded = set()
+        self._scales = {}
         self._output_leaf = None
         layers = [entry for entry in self._trace if entry[1] in ("layer", "norm")]
         if final:
@@ -273,6 +277,10 @@ class FlaxBackend(Backend):
                     verdict = ""  # genuinely linear between the two layers
                 else:
                     verdict = self._identify(z, x)
+                    factor = None if verdict else _scalar_ratio(z if last is None else last, x)
+                    if factor is not None:
+                        self._scales[current[0]] = factor
+                        verdict = ""
                 if verdict is None:
                     continue
                 if current[0] == _MODEL_OUTPUT:
@@ -346,6 +354,9 @@ class FlaxBackend(Backend):
                         meta={"activation": ActivationRef(inferred), "input_of": index},
                     )
                 )
+                previous = nodes[-1].id
+            if index in self._scales:
+                nodes.append(_scale_node(index, self._scales[index], previous))
                 previous = nodes[-1].id
             nid = _trace_id(index, op, path)
             if kind == "activation":
@@ -427,6 +438,9 @@ class FlaxBackend(Backend):
                 )
             )
             previous = nodes[-1].id
+        if _MODEL_OUTPUT in self._scales:
+            nodes.append(_scale_node(_MODEL_OUTPUT, self._scales[_MODEL_OUTPUT], previous))
+            previous = nodes[-1].id
         nodes.append(Node("output", NodeKind.OUTPUT, "output", (previous,)))
         return ModelGraph(
             _mark_tied(nodes),
@@ -505,6 +519,7 @@ class FlaxBackend(Backend):
         recorder = TapRecorder()
         index_to_id = dict(self._trace_ids())
         input_to_id = {index: _inferred_id(name, index) for index, name in self._inferred.items()}
+        input_to_id.update({index: _inferred_id("scale", index) for index in self._scales})
 
         def record(table: dict[int, str], index: int, value: Any) -> None:
             nid = table.get(index)
@@ -725,6 +740,28 @@ def _close(a: np.ndarray, b: np.ndarray) -> bool:
         return False
     scale = float(np.abs(b).max(initial=0.0))
     return bool(np.allclose(a, b, rtol=1e-5, atol=1e-6 * scale))
+
+
+def _scalar_ratio(base: np.ndarray, x: np.ndarray) -> float | None:
+    """``c`` when ``x`` is ``c * base`` to working precision, else ``None``."""
+    base = np.asarray(base, dtype=np.float64).ravel()
+    x = np.asarray(x, dtype=np.float64).ravel()
+    norm = float(base @ base)
+    if base.shape != x.shape or norm == 0.0:
+        return None
+    factor = float(base @ x) / norm
+    return factor if _close(factor * base, x) else None
+
+
+def _scale_node(index: int, factor: float, previous: str) -> Node:
+    """A constant factor read off the probe, applied before the layer at ``index``."""
+    return Node(
+        _inferred_id("scale", index),
+        NodeKind.SCALE,
+        "scale",
+        (previous,),
+        meta={"factor": MomentState.of_values(factor), "input_of": index},
+    )
 
 
 def _holder_of(fn: Any) -> Any:

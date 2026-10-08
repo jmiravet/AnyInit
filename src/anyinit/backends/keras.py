@@ -201,7 +201,7 @@ class KerasBackend(Backend):
             if built[0].kind is NodeKind.INPUT:
                 self._input_ids.append(last)
             else:
-                self._order.append((last, op, inputs))
+                self._order.append((last, _replayable(op, self._keras), inputs))
             waiting.extend((op, call) for call in reverse)
             _emit_tied_readouts(waiting, producer, nodes, self._order)
 
@@ -265,6 +265,12 @@ class KerasBackend(Backend):
                     meta={"activation": ActivationRef.of(canonical, **params), "path": nid},
                 )
             ]
+
+        scaled = _constant_factor(layer)
+        if scaled is not None:
+            factor, offset = scaled
+            meta = {"path": nid, "factor": factor, "offset": offset}
+            return [Node(nid, NodeKind.SCALE, cls, inputs, meta=meta)]
 
         if cls in _MERGE_LAYERS:
             op = _MERGE_LAYERS[cls]
@@ -640,6 +646,65 @@ def _spatial_rank(name: str) -> int:
     """Spatial dimensionality implied by a layer name."""
     match = re.search(r"([123])\s*[dD]", name)
     return int(match.group(1)) if match else 2
+
+
+# ------------------------------------------------------------- constants
+
+
+def _constant_factor(layer: Any) -> tuple[MomentState, float] | None:
+    """The constant factor and offset of a ``Rescaling`` layer, or of ``x * c`` and ``x / c``.
+
+    In a functional model ``x * c`` is an operation whose recorded call holds ``c``.
+    ``None`` when the factor is not a constant, as in the ``Multiply`` merge layer, and
+    for an offset that is not a single number.
+    """
+    cls = type(layer).__name__
+    if cls == "Rescaling":
+        offset = np.asarray(layer.offset, dtype=np.float64)
+        if offset.size != 1:
+            return None
+        return MomentState.of_values(layer.scale), float(offset.ravel()[0])
+    if cls not in ("Multiply", "Divide", "TrueDivide"):
+        return None
+    calls = getattr(layer, "_inbound_nodes", [])
+    args = tuple(getattr(getattr(calls[0], "arguments", None), "args", ())) if calls else ()
+    if len(args) != 2:
+        return None
+    symbolic = [_is_symbolic(a) for a in args]
+    if symbolic.count(True) != 1:
+        return None
+    constant = np.asarray(args[symbolic.index(False)], dtype=np.float64)
+    if cls == "Multiply":
+        return MomentState.of_values(constant), 0.0
+    if not symbolic[0] or constant.size != 1 or float(constant.ravel()[0]) == 0.0:
+        return None
+    return MomentState.of_values(1.0 / float(constant.ravel()[0])), 0.0
+
+
+def _is_symbolic(value: Any) -> bool:
+    return type(value).__name__ == "KerasTensor"
+
+
+def _replayable(op: Any, keras: Any) -> Any:
+    """``op`` with the constants of its recorded call bound, for a plain operation.
+
+    Layers are replayed by calling them on their inputs, which is how they were called.
+    An operation such as ``x * 2.0`` or ``ops.clip(x, 0, 1)`` also took constants, so it is
+    called with the replayed tensors put back where its symbolic inputs were.
+    """
+    calls = getattr(op, "_inbound_nodes", [])
+    if isinstance(op, keras.layers.Layer) or len(calls) != 1:
+        return op
+    arguments = getattr(calls[0], "arguments", None)
+    args = tuple(getattr(arguments, "args", ()))
+    kwargs = dict(getattr(arguments, "kwargs", {}))
+
+    def call(argument: Any, training: Any = None) -> Any:
+        tensors = iter(argument if isinstance(argument, list) else [argument])
+        bound = [next(tensors) if _is_symbolic(a) else a for a in args]
+        return op(*bound, **kwargs)
+
+    return call
 
 
 # ------------------------------------------------------------ tied tables

@@ -210,3 +210,30 @@ def test_reverse_call_on_an_untied_table_is_not_tying():
     report = anyinit.initialize(model, input_spec=batch, seed=0)
 
     assert not any("tied embedding" in w for w in report.warnings)
+
+
+def test_operations_with_constants_are_replayed_and_solved_around():
+    """``x * c`` is an operation, not a layer; replaying it needs the constant back."""
+    inputs = keras.Input((64,))
+    h = layers.Dense(64, activation="relu")(inputs)
+    h = layers.Dense(64)(h * 8.0 / 2.0)
+    model = keras.Model(inputs, layers.Activation("relu")(h))
+    report = anyinit.initialize(model, input_spec=(1024, 64), seed=0)
+
+    assert all(r.measured is not None for r in report.layers)
+    # The target holds where the next layer reads, past the factor.
+    assert report.layers[0].scale == pytest.approx((2.0 / 64) ** 0.5 / 4.0)
+    report.assert_healthy()
+
+
+def test_rescaling_is_applied_before_the_first_layer():
+    pixels = np.random.default_rng(0).uniform(0, 255, (1024, 64)).astype("float32")
+    model = keras.Sequential(
+        [
+            keras.Input((64,)),
+            layers.Rescaling(1 / 127.5, offset=-1.0),
+            layers.Dense(256, activation="relu"),
+        ]
+    )
+    report = anyinit.initialize(model, input_spec=pixels, seed=0)
+    report.assert_healthy()

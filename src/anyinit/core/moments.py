@@ -9,6 +9,9 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Any
+
+import numpy as np
 
 #: Second-moment kurtosis above which a signal is treated as heavy-tailed and the
 #: Gaussian pre-activation assumption gets the scale-mixture correction.
@@ -27,6 +30,13 @@ class MomentState:
     def standard_normal(cls) -> MomentState:
         """Moments of a standard normal signal, the default network input."""
         return cls(mean=0.0, m2=1.0, m4=3.0)
+
+    @classmethod
+    def of_values(cls, values: Any) -> MomentState:
+        """Moments of the entries of an array, or of a single number."""
+        flat = np.asarray(values, dtype=np.float64).ravel()
+        squares = flat * flat
+        return cls(float(flat.mean()), float(squares.mean()), float((squares * squares).mean()))
 
     @classmethod
     def zero(cls) -> MomentState:

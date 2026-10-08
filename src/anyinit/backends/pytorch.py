@@ -25,6 +25,10 @@ from ..core.registry import ActivationRef
 from ..errors import TraceError
 from .base import Backend, TapRecorder, module_roots
 
+#: Names of the calls that multiply or divide, as functions and as tensor methods.
+_MULTIPLY_NAMES = frozenset({"mul", "imul", "mul_", "multiply"})
+_DIVIDE_NAMES = frozenset({"truediv", "itruediv", "div", "div_", "divide", "true_divide"})
+
 #: Normalization layer class names, matched by name so a class missing from an older torch
 #: release is simply absent.
 _NORM_NAMES = frozenset(
@@ -423,6 +427,12 @@ class TorchBackend(Backend):
                     meta={"activation": ActivationRef(custom)},
                 )
             ]
+
+        scaled = _constant_factor(fx_node, graph_module)
+        if scaled is not None:
+            factor, constant = scaled
+            signal = tuple(i for i in inputs if i != constant)
+            return [Node(nid, NodeKind.SCALE, name, signal, meta={"factor": factor})]
 
         if fx_node.op == "call_function" and target in _MERGE_FUNCTIONS:
             op = _MERGE_FUNCTIONS[target]
@@ -987,6 +997,55 @@ class TorchBackend(Backend):
             batch = torch.randn(tuple(input_spec), generator=generator)
             return batch if self._device is None else batch.to(self._device, self._dtype)
         return input_spec
+
+
+# ------------------------------------------------------------- constants
+
+
+def _constant_factor(fx_node: Any, graph_module: Any) -> tuple[MomentState, str | None] | None:
+    """The constant a call multiplies its one tensor input by, when it can be read.
+
+    A number written in ``forward()`` is a literal in the traced call; a buffer or
+    parameter is read off the module.  Returns the constant's moments and, for a tensor,
+    the name of the node that fetched it, which is not a signal input.  ``None`` for a
+    product of two computed tensors, which is a merge, and for a division by anything but
+    a number or a one-element tensor.
+    """
+    from torch import fx
+
+    name = getattr(fx_node.target, "__name__", str(fx_node.target))
+    divide = name in _DIVIDE_NAMES
+    if fx_node.op not in ("call_function", "call_method") or not (
+        divide or name in _MULTIPLY_NAMES
+    ):
+        return None
+    if len(fx_node.args) != 2 or fx_node.kwargs:
+        return None
+
+    left, right = fx_node.args
+    if isinstance(left, fx.Node) and left.op != "get_attr":
+        operand = right
+    elif not divide:
+        operand = left  # c * x
+    else:
+        return None  # c / x is not a scaling
+
+    if isinstance(operand, (int, float)) and not isinstance(operand, bool):
+        constant = np.asarray(float(operand))
+    elif isinstance(operand, fx.Node) and operand.op == "get_attr":
+        tensor = graph_module
+        for part in str(operand.target).split("."):
+            tensor = getattr(tensor, part)
+        constant = tensor.detach().to("cpu").double().numpy()
+    else:
+        return None  # a computed tensor: a merge
+
+    if divide:
+        if constant.size != 1 or float(constant.ravel()[0]) == 0.0:
+            return None
+        constant = 1.0 / constant
+    fetched = operand.name if isinstance(operand, fx.Node) else None
+    return MomentState.of_values(constant), fetched
 
 
 # ------------------------------------------------------------ tied tables

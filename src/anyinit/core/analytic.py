@@ -424,6 +424,10 @@ class _Context:
         if kind is NodeKind.MERGE:
             return transfer.through_merge(incoming, node.op)
 
+        if kind is NodeKind.SCALE:
+            offset = float(node.meta.get("offset", 0.0))
+            return transfer.through_scale(state_in, node.meta["factor"], offset)
+
         if kind is NodeKind.DROPOUT:
             return transfer.through_dropout(state_in, float(node.meta.get("p", 0.0)))
 

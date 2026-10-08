@@ -25,6 +25,9 @@ class NodeKind(enum.Enum):
     ACTIVATION = "activation"
     POOL = "pool"
     MERGE = "merge"
+    SCALE = "scale"
+    """Multiplication by a constant the backend could read: ``meta["factor"]`` holds the
+    constant's moments and ``meta["offset"]``, when present, a constant added after it."""
     DROPOUT = "dropout"
     SHAPE = "shape"
     OTHER = "other"
@@ -36,7 +39,14 @@ SCALABLE = frozenset({NodeKind.PARAMETRIC, NodeKind.NORMALIZATION})
 
 #: Nodes a search walks straight through when pairing layers with activations.
 TRANSPARENT = frozenset(
-    {NodeKind.POOL, NodeKind.DROPOUT, NodeKind.SHAPE, NodeKind.MERGE, NodeKind.OTHER}
+    {
+        NodeKind.POOL,
+        NodeKind.DROPOUT,
+        NodeKind.SHAPE,
+        NodeKind.MERGE,
+        NodeKind.SCALE,
+        NodeKind.OTHER,
+    }
 )
 
 

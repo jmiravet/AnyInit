@@ -3,8 +3,9 @@
 When a language model reuses its embedding table as the output layer, the table plays two
 roles that want different scales. As a lookup nothing sums over it, so its rows want a
 scale of 1. As the output layer it sums over `d` inputs, so it wants `1/√d` for
-unit-variance logits. AnyInit gives the table the output's scale and says so in the report.
-These are the measurements behind that choice.
+unit-variance logits. AnyInit gives the table the output's scale, counting any constant
+factor the model applies to the logits, and says so in the report. These are the
+measurements behind that choice.
 
 **Setup.** A 4-layer pre-LN GPT with no positional embedding, trained for 800 steps on
 wikitext-2 with the Pythia tokenizer (V = 33,527, ln V = 10.4). AdamW, best of a learning
@@ -17,7 +18,7 @@ rate sweep, mean of 2 seeds. The rest of the network is initialized identically 
 | C | tied, σ = 1/√d, lookup × √d (Transformer, Gemma) | 11.2 → 28.3 | **5.77** | 5.71 |
 | D | tied, σ = 1, logits × 1/√d (PaLM, T5) | 11.2 → 28.3 | 6.00 | 6.15 |
 | D′ | D, with the table's learning rate × √d | 11.2 → 28.3 | 5.86 | **5.66** |
-| F | tied, σ = 1/√d, no multiplier (what AnyInit writes) | 10.8 → 11.0 | 5.87 | 5.88 |
+| F | tied, σ = 1/√d, no multiplier (AnyInit, without a multiplier) | 10.8 → 11.0 | 5.87 | 5.88 |
 | E | untied: lookup σ = 1, output σ = 1/√d | 10.9 → 10.9 | 5.92 | 5.73 |
 
 **Conclusions.**
@@ -43,15 +44,15 @@ The models are small and short-trained; differences under 0.05 nats are within s
 out of its reach: a multiplier in the forward pass, which is architecture, and the table's
 learning rate, which is the optimizer's.
 
-*1. Multiply the lookup by √d.* This is C, the best tied variant measured. With it the
-scale AnyInit writes gives the lookup unit variance and leaves the logits alone. A model
-that scales the logits by 1/√d instead (PaLM, T5) starts them at standard deviation 1/√d
-under AnyInit, which cannot see that multiplier; moving it to the lookup fixes that.
+*1. Multiply the lookup by √d.* This is C, the best tied variant measured. The table keeps
+the output's scale and the lookup arrives with unit variance. Scaling the logits by 1/√d
+instead (PaLM, T5) also serves both roles: AnyInit then gives the table a scale of 1,
+which needs recommendation 2.
 
-The analytic mode does not see a constant multiplier on the lookup either. In a pre-norm
-Transformer every reader of the lookup normalizes it first, so the solved scales come out
-the same. Where a layer reads the lookup directly, use `mode="empirical"`; otherwise the
-report's validation line shows the gap.
+AnyInit reads a constant factor wherever it sits: a number, buffer or parameter in
+PyTorch, a number in a Keras operation or a `Rescaling` layer, and in Flax a scalar factor
+recognized from its values. A factor computed in `forward()` from other tensors is not a
+constant; `mode="empirical"` measures what it does.
 
 PyTorch:
 
@@ -111,11 +112,11 @@ model = keras.Model(ids, logits)
 ```
 
 *2. Match the table's learning rate to its scale.* Adam's step does not depend on a
-parameter's size, so what moves the table is the learning rate relative to its scale. At
-the 1/√d AnyInit writes, use the rate of the rest of the model. A table kept at σ = 1, as
-in the PaLM and T5 recipes or when it is reinitialized after AnyInit, needs √d times that
-rate (D′); PaLM gets the same from Adafactor's parameter scaling. Under a schedule, keep
-the ratio. The snippets are for that σ = 1 case.
+parameter's size, so what moves the table is the learning rate relative to its scale. With
+the lookup multiplier the table is at 1/√d, and the rate of the rest of the model is right.
+With a logit multiplier it is at σ = 1, and it needs √d times that rate (D′); PaLM gets
+the same from Adafactor's parameter scaling. Under a schedule, keep the ratio. The
+snippets are for the σ = 1 case.
 
 PyTorch, where a tied table is listed once among the parameters:
 
