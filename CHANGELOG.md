@@ -1,27 +1,76 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
 
-### Fixed
+### Tied embeddings and constant factors
 
-- An embedding table tied to the output layer was scaled as a lookup alone, which leaves
-  the logits at standard deviation √d_model and an initial loss that grows with width. A
-  PyTorch model with a `Linear` head escaped only because the head was written last, and
-  the report said nothing either way. Tied tables are now detected (a shared `Parameter`,
-  or `F.linear` and `@` on an embedding's weight, in PyTorch; `Embed.attend` in Flax;
-  `reverse=True` calls of a tied `ReversibleEmbedding` in Keras), given the output layer's
-  scale, held at it through the solve, and reported. The docs give the measurements behind
-  the choice and what to do beyond initialization: a √d multiplier on the lookup, and the
-  table's learning rate.
-- A multiplication by a constant was taken for the identity by the analytic mode, so the
-  layer reading it was scaled for the wrong input: `x * c`, `c * x`, `x / c` and scalar or
-  per-channel buffers and parameters in PyTorch, `x * c` and `Rescaling` in Keras, and in
-  Flax any scalar factor, which the report called a transform it could not identify. Such
-  factors are now read and propagated, and the table of a tied embedding counts the ones
-  around the output layer, so a model that scales its logits by 1/√d gets a table of 1.
-- Keras: an operation holding a constant, such as `x * 2.0` in a functional model, could
-  not be replayed, so validation and the empirical mode measured nothing after it.
-- Keras: a subclass of `Embedding` was laid out as a dense kernel.
+An embedding table tied to the output layer was scaled as a lookup only. That leaves the
+logits at standard deviation √d_model, so the initial loss grows with width. This release
+detects tied tables, gives them the output layer's scale and keeps that scale fixed
+during the solve. The report says what the lookup ends up with.
+
+Along the way, the analytic mode now reads constant factors (`x * c`, `x / c`,
+`Rescaling`, …) instead of treating them as the identity.
+
+### Changes
+
+**Tied tables** (`core/tying.py`)
+
+- Backends mark every node that reads a tied table with a shared `meta["tied"]` key:
+  - PyTorch: a shared `Parameter`, or `F.linear` / `@` on an embedding's weight
+  - Flax: `Embed.attend`
+  - Keras: `reverse=True` calls of a tied `ReversibleEmbedding`
+- `tying.find` groups those nodes, gives the table the output role's scale
+  `1/(c·√d_model)` and passes it to the solve as fixed. Here `c` is any constant factor
+  the model applies around the output layer.
+- The report gets one line per tied table, linking to the new experiment page.
+
+**Constant factors** (new `NodeKind.SCALE`)
+
+- PyTorch: `x * c`, `c * x`, `x / c`, and scalar or per-channel buffers and parameters
+- Keras: `x * c`, `x / c` and `Rescaling`
+- Flax: any scalar factor between two layers, read off the probe
+- `transfer.through_scale` propagates moments through these nodes, and `SCALE` is
+  transparent to the layer/activation pairing.
+
+**Keras fixes**
+
+- Operations holding a constant, such as `x * 2.0` in a functional model, can now be
+  replayed. Before, validation and the empirical mode measured nothing after them.
+- Subclasses of `Embedding` are no longer laid out as dense kernels.
+
+**Docs**
+
+- New experiment page, `docs/experiments/tied-embeddings.md`, with the measurements
+  behind the choice and what to do beyond initialization (a √d multiplier on the lookup,
+  and the table's learning rate).
+
+### Behavior change
+
+The analytic mode now gives different results for models that multiply by a constant.
+Those results now match the empirical mode, which measured the real network all along.
+One thing to note: the solver now compensates for a factor the user added on purpose. For
+example, in `h + 0.5 * relu(f(h))` the weights of `f` double. The empirical mode already
+did this.
+
+| Model | Weight | before | after | empirical |
+|---|---|---|---|---|
+| `h + 0.5 * relu(f(h))` | `f.weight` | 0.177 | 0.354 | 0.345 |
+| LayerScale `h + γ·f(h)` | `f3.weight` | 0.125 | 0.177 | 0.184 |
+
+### Testing
+
+- Full suite: 419 passed, none skipped (PyTorch, Keras on torch, Flax). The 382 existing
+  tests are unchanged, and there are 37 new ones.
+- `ruff check`, `ruff format --check` and `mypy` are clean.
+- 0.2.0 and this release were run on the same set of ordinary models, with the same seed,
+  in both modes, comparing the std of every weight and the report warnings. Results are
+  identical everywhere except the two constant-factor rows above.
+  - PyTorch: MLPs, CNN with BatchNorm, ResNet18, MobileNetV3, EfficientNet-B0,
+    ConvNeXt-tiny, ViT, `nn.TransformerEncoder`, an untied LM, and the torch.fx fallback.
+  - Models that share weights without tying: shared `Linear` weights, an embedding looked
+    up twice, `h @ linear.weight.T`, GLU-style gating.
+  - Keras and Flax: MLPs, CNNs, residuals, gating, LMs, shared layers.
 
 ## 0.2.0
 
