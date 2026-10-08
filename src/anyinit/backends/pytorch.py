@@ -327,12 +327,18 @@ class TorchBackend(Backend):
 
         for fx_node in graph_module.graph.nodes:
             inputs = tuple(emitted[n.name] for n in fx_node.all_input_nodes if n.name in emitted)
-            built = self._classify(fx_node, graph_module, inputs, native_calls, leaf_types)
+            readout = _tied_readout(fx_node, model, graph_module, emitted)
+            built = (
+                [readout]
+                if readout is not None
+                else self._classify(fx_node, graph_module, inputs, native_calls, leaf_types)
+            )
             nodes.extend(built)
             emitted[fx_node.name] = (
                 built[-1].id if built else (inputs[0] if inputs else fx_node.name)
             )
             self._node_names[fx_node.name] = emitted[fx_node.name]
+        nodes = _mark_tied(nodes)
 
         # Nodes expanded out of a container module have no FX node of their own; they are
         # read through hooks on the submodule that produces or consumes them.
@@ -772,7 +778,7 @@ class TorchBackend(Backend):
 
         nodes.append(Node("output", NodeKind.OUTPUT, "output", (previous,)))
         return ModelGraph(
-            nodes,
+            _mark_tied(nodes),
             fidelity=FIDELITY_LINEAR,
             notes=(
                 f"torch.fx could not trace this model ({reason}); fell back to module "
@@ -981,6 +987,84 @@ class TorchBackend(Backend):
             batch = torch.randn(tuple(input_spec), generator=generator)
             return batch if self._device is None else batch.to(self._device, self._dtype)
         return input_spec
+
+
+# ------------------------------------------------------------ tied tables
+
+
+def _tied_readout(
+    fx_node: Any, model: Any, graph_module: Any, emitted: dict[str, str]
+) -> Node | None:
+    """An output layer written as a product with an embedding's table.
+
+    ``F.linear(h, emb.weight)`` and ``h @ emb.weight.T`` use the table without a module of
+    their own, so without this they would pass for an opaque function and the table would
+    be scaled as a lookup alone.  A ``Linear`` head that shares the table is an ordinary
+    layer and needs nothing here; :func:`_mark_tied` finds both.
+    """
+    from torch import fx
+
+    name = getattr(fx_node.target, "__name__", str(fx_node.target))
+    if fx_node.op not in ("call_function", "call_method") or name not in ("linear", "matmul"):
+        return None
+    if len(fx_node.args) < 2 or not isinstance(fx_node.args[0], fx.Node):
+        return None
+    source, weight = fx_node.args[0], fx_node.args[1]
+    transposed = isinstance(weight, fx.Node) and (
+        (weight.op == "call_method" and weight.target in ("t", "transpose"))
+        or (weight.op == "call_function" and weight.target is getattr and weight.args[1] == "T")
+    )
+    if transposed:
+        weight = weight.args[0]
+    # linear(h, W) computes h @ W.T itself; a matmul has to be given the transpose.
+    if transposed != (name == "matmul") or getattr(weight, "op", None) != "get_attr":
+        return None
+    if source.name not in emitted:
+        return None
+
+    table = graph_module
+    for part in str(weight.target).split("."):
+        table = getattr(table, part)
+    owner = next(
+        (
+            (path, module)
+            for path, module in model.named_modules()
+            if type(module).__name__.startswith("Embedding") and module.weight is table
+        ),
+        None,
+    )
+    if owner is None:
+        return None
+    path, module = owner
+    return Node(
+        fx_node.name,
+        NodeKind.PARAMETRIC,
+        name,
+        (emitted[source.name],),
+        spec=fanmod.ParamSpec(fanmod.DENSE, tuple(int(s) for s in table.shape)),
+        handle=TorchHandle(module, "weight"),
+        meta={"path": f"{path}.T"},
+    )
+
+
+def _mark_tied(nodes: list[Node]) -> list[Node]:
+    """Key every node reading an embedding's table, when more than one reads it.
+
+    Tying assigns one ``Parameter`` to two modules, so it shows in the tensor, not in the
+    module.  :mod:`anyinit.core.tying` decides what the table gets.
+    """
+    readers: dict[int, list[int]] = {}
+    for position, node in enumerate(nodes):
+        if node.kind is NodeKind.PARAMETRIC and isinstance(node.handle, TorchHandle):
+            readers.setdefault(id(node.handle.tensor), []).append(position)
+
+    marked = list(nodes)
+    for key, positions in readers.items():
+        group = [nodes[p] for p in positions]
+        if len(group) > 1 and any(n.spec and n.spec.kind == fanmod.EMBEDDING for n in group):
+            for position in positions:
+                marked[position] = nodes[position].with_meta(tied=f"tensor:{key}")
+    return marked
 
 
 # ------------------------------------------------------------------ helpers

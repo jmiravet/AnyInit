@@ -11,6 +11,7 @@ two IR nodes; otherwise the solver would see a layer with no activation after it
 from __future__ import annotations
 
 import contextlib
+import functools
 import re
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
@@ -179,23 +180,30 @@ class KerasBackend(Backend):
             for tensor in _model_inputs(model):
                 producer[id(tensor)] = "anyinit_input"
 
+        waiting: list[tuple[Any, Any]] = []
         for op in operations:
+            reverse = _reverse_calls(op)
+            calls = [node for node in getattr(op, "_inbound_nodes", []) if node not in reverse]
             inputs = tuple(
                 producer[id(tensor)]
-                for node in getattr(op, "_inbound_nodes", [])
+                for node in calls
                 for tensor in _input_tensors(node)
                 if id(tensor) in producer
             )
             built = self._from_layer(op, inputs)
+            if reverse:
+                built = [node.with_meta(tied=_table_key(op)) for node in built]
             nodes.extend(built)
             last = built[-1].id
-            for node in getattr(op, "_inbound_nodes", []):
+            for node in calls:
                 for tensor in _output_tensors(node):
                     producer[id(tensor)] = last
             if built[0].kind is NodeKind.INPUT:
                 self._input_ids.append(last)
             else:
                 self._order.append((last, op, inputs))
+            waiting.extend((op, call) for call in reverse)
+            _emit_tied_readouts(waiting, producer, nodes, self._order)
 
         outputs = {n.id for n in nodes} - {src for n in nodes for src in n.inputs}
         terminal = [nid for nid in (n.id for n in nodes) if nid in outputs]
@@ -363,7 +371,7 @@ class KerasBackend(Backend):
         groups = int(getattr(layer, "groups", 1) or 1)
         has_bias = getattr(layer, "bias", None) is not None
 
-        if cls == "Embedding":
+        if _is_embedding(layer):
             return fanmod.ParamSpec(fanmod.EMBEDDING, shape)
         if cls in {"Dense", "EinsumDense"}:
             return fanmod.ParamSpec(fanmod.DENSE, (shape[1], shape[0]), has_bias=has_bias)
@@ -634,11 +642,72 @@ def _spatial_rank(name: str) -> int:
     return int(match.group(1)) if match else 2
 
 
+# ------------------------------------------------------------ tied tables
+
+
+def _is_embedding(layer: Any) -> bool:
+    """Whether ``layer`` is an ``Embedding`` or a subclass, such as keras_hub's tied one."""
+    return any(cls.__name__ == "Embedding" for cls in type(layer).__mro__)
+
+
+def _reverse_calls(layer: Any) -> list[Any]:
+    """Calls that use an embedding's table as the output layer.
+
+    Keras has no tying of its own; ``keras_hub.layers.ReversibleEmbedding`` is the usual
+    way, called a second time as ``layer(h, reverse=True)`` to compute ``h @ table.T``.
+    """
+    if not _is_embedding(layer):
+        return []
+    return [
+        call
+        for call in getattr(layer, "_inbound_nodes", [])
+        if getattr(getattr(call, "arguments", None), "kwargs", {}).get("reverse")
+    ]
+
+
+def _table_key(layer: Any) -> str:
+    return f"variable:{id(layer.embeddings)}"
+
+
+def _emit_tied_readouts(
+    waiting: list[tuple[Any, Any]],
+    producer: dict[int, str],
+    nodes: list[Node],
+    order: list[tuple[str, Any, tuple[str, ...]]],
+) -> None:
+    """Emit each waiting ``reverse=True`` call once everything it reads has been emitted.
+
+    A layer appears once among a model's operations, where it is first called, but its
+    reverse call reads the end of the network, so it is placed later, as its own node.
+    """
+    for layer, call in list(waiting):
+        sources = tuple(producer.get(id(tensor)) for tensor in _input_tensors(call))
+        if not sources or None in sources:
+            continue
+        waiting.remove((layer, call))
+        nid = f"{layer.name}_reverse"
+        nodes.append(
+            Node(
+                nid,
+                NodeKind.PARAMETRIC,
+                type(layer).__name__,
+                tuple(str(s) for s in sources),
+                spec=fanmod.ParamSpec(fanmod.DENSE, tuple(int(s) for s in layer.embeddings.shape)),
+                # Stored (vocab, d_model), which is already (fan_out, fan_in).
+                handle=KerasHandle(layer, "kernel"),
+                meta={"path": nid, "tied": _table_key(layer)},
+            )
+        )
+        order.append((nid, functools.partial(layer, reverse=True), nodes[-1].inputs))
+        for tensor in _output_tensors(call):
+            producer[id(tensor)] = nid
+
+
 def _to_canonical(handle: KerasHandle, native: np.ndarray) -> np.ndarray:
     if handle.role != "kernel" or native.ndim < 2:
         return native
     cls = type(handle.layer).__name__
-    if cls == "Embedding":
+    if _is_embedding(handle.layer):
         return native
     if cls in ("Dense", "EinsumDense"):
         return native.T
@@ -658,7 +727,7 @@ def _from_canonical(
     if handle.role != "kernel" or weight.ndim < 2:
         return weight.reshape(native_shape)
     cls = type(handle.layer).__name__
-    if cls == "Embedding":
+    if _is_embedding(handle.layer):
         return weight.reshape(native_shape)
     if cls in ("Dense", "EinsumDense"):
         return weight.T.reshape(native_shape)

@@ -241,3 +241,51 @@ def test_initializing_does_not_load_dynamo():
     )
     proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr
+
+
+class _TiedLM(nn.Module):
+    """An embedding whose table is also the output layer, written one of four ways."""
+
+    def __init__(self, head: str, vocab: int = 500, width: int = 64):
+        super().__init__()
+        self.form = head
+        self.emb = nn.Embedding(vocab, width)
+        self.fc = nn.Linear(width, width)
+        self.norm = nn.LayerNorm(width)
+        if head == "module":
+            self.head = nn.Linear(width, vocab, bias=False)
+            self.head.weight = self.emb.weight
+
+    def forward(self, idx):
+        h = self.norm(torch.relu(self.fc(self.emb(idx))))
+        if self.form == "module":
+            return self.head(h)
+        if self.form == "linear":
+            return torch.nn.functional.linear(h, self.emb.weight)
+        if self.form == "T":
+            return h @ self.emb.weight.T
+        return torch.matmul(h, self.emb.weight.t())
+
+
+@pytest.mark.parametrize("head", ["module", "linear", "T", "t"])
+@pytest.mark.parametrize("mode", ["analytic", "empirical"])
+def test_tied_table_takes_the_output_scale(head, mode):
+    from anyinit.core.tying import DOCS
+
+    model = _TiedLM(head)
+    idx = torch.randint(0, 500, (16, 32), generator=torch.Generator().manual_seed(0))
+    report = anyinit.initialize(model, mode, input_spec=idx, seed=0)
+
+    assert float(model.emb.weight.detach().std()) == pytest.approx(64**-0.5, rel=1e-2)
+    with torch.no_grad():
+        assert float(model(idx).var()) == pytest.approx(1.0, rel=0.1)
+    assert any(DOCS in w for w in report.warnings)
+
+
+def test_untied_embedding_keeps_the_lookup_scale():
+    model = _TiedLM("module")
+    model.head.weight = nn.Parameter(torch.empty(500, 64))
+    report = anyinit.initialize(model, seed=0)
+
+    assert float(model.emb.weight.detach().std()) == pytest.approx(1.0, rel=1e-2)
+    assert not any("tied embedding" in w for w in report.warnings)

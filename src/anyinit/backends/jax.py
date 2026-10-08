@@ -347,7 +347,7 @@ class FlaxBackend(Backend):
                     )
                 )
                 previous = nodes[-1].id
-            nid = "/".join(path) if path else f"{op}_{index}"
+            nid = _trace_id(index, op, path)
             if kind == "activation":
                 canonical = _CANONICAL.get(op, op)
                 nodes.append(
@@ -383,6 +383,8 @@ class FlaxBackend(Backend):
                             meta={"path": nid, "trace_index": index, "affine": False},
                         )
                     )
+            elif op == _ATTEND:
+                nodes.append(_tied_readout(nid, path, previous, index, self._flat))
             else:
                 spec_kind, param_name = _LAYERS[op]
                 weight_path = (*path, param_name)
@@ -427,7 +429,7 @@ class FlaxBackend(Backend):
             previous = nodes[-1].id
         nodes.append(Node("output", NodeKind.OUTPUT, "output", (previous,)))
         return ModelGraph(
-            nodes,
+            _mark_tied(nodes),
             fidelity=FIDELITY_LINEAR,
             notes=(
                 "the JAX backend recovers call order, not graph structure, so residual "
@@ -525,7 +527,7 @@ class FlaxBackend(Backend):
 
     def _trace_ids(self) -> Iterator[tuple[int, str]]:
         for index, _kind, op, path in self._trace:
-            yield index, ("/".join(path) if path else f"{op}_{index}")
+            yield index, _trace_id(index, op, path)
 
     # --------------------------------------------------------------- lifecycle
 
@@ -589,9 +591,9 @@ def _instrumented(
         trace.append((index, kind, op, path))
         return index
 
-    def wrap_layer(cls: Any, op: str, kind: str) -> None:
-        original = cls.__call__
-        saved.append((cls, "__call__", original))
+    def wrap_layer(cls: Any, op: str, kind: str, method: str = "__call__") -> None:
+        original = getattr(cls, method)
+        saved.append((cls, method, original))
 
         def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
             if depth[0]:
@@ -612,7 +614,7 @@ def _instrumented(
                 observe(index, out)
             return out
 
-        cls.__call__ = wrapper
+        setattr(cls, method, wrapper)
 
     def wrap_function(holder: Any, attr: str) -> None:
         original = getattr(holder, attr, None)
@@ -640,6 +642,7 @@ def _instrumented(
             cls = getattr(nn, op, None)
             if cls is not None:
                 wrap_layer(cls, op, "layer")
+        wrap_layer(nn.Embed, _ATTEND, "layer", method="attend")
         for op in _NORMS:
             cls = getattr(nn, op, None)
             if cls is not None:
@@ -691,6 +694,13 @@ _MODEL_OUTPUT = -1
 _WEIGHT_NAMES = frozenset(name for _, name in _LAYERS.values())
 
 
+def _trace_id(index: int, op: str, path: tuple[str, ...]) -> str:
+    """Node id of a traced call: its parameter path, or its op where it has none."""
+    base = "/".join(path) if path else f"{op}_{index}"
+    # attend() runs under the same scope as the lookup, so the path alone would collide.
+    return f"{base}/attend" if op == _ATTEND else base
+
+
 def _inferred_id(name: str, index: int) -> str:
     """Node id of an activation identified from values, by the layer it feeds."""
     return f"{name}_before_{'output' if index == _MODEL_OUTPUT else index}"
@@ -723,6 +733,48 @@ def _holder_of(fn: Any) -> Any:
 
     module_name = getattr(fn, "__module__", None)
     return sys.modules.get(module_name) if module_name else None
+
+
+# ------------------------------------------------------------ tied tables
+
+#: Trace op of ``nn.Embed.attend``, the embedding's table used as the output layer.
+_ATTEND = "Embed.attend"
+
+
+def _tied_readout(
+    nid: str,
+    path: tuple[str, ...],
+    previous: str,
+    index: int,
+    flat: dict[tuple[str, ...], np.ndarray],
+) -> Node:
+    """``Embed.attend(h)``, which is ``h @ table.T``: a dense layer on the lookup's table."""
+    table = (*path, "embedding")
+    return Node(
+        nid,
+        NodeKind.PARAMETRIC,
+        _ATTEND,
+        (previous,),
+        spec=fanmod.ParamSpec(fanmod.DENSE, tuple(int(s) for s in flat[table].shape)),
+        # Stored (vocab, d_model), which is already (fan_out, fan_in): no transpose.
+        handle=FlaxHandle(table, fanmod.EMBEDDING),
+        meta={"path": nid, "trace_index": index},
+    )
+
+
+def _mark_tied(nodes: list[Node]) -> list[Node]:
+    """Key the lookup and the ``attend`` of one table alike, for :mod:`anyinit.core.tying`."""
+    attended = {
+        node.handle.path
+        for node in nodes
+        if node.op == _ATTEND and isinstance(node.handle, FlaxHandle)
+    }
+    return [
+        node.with_meta(tied="/".join(node.handle.path))
+        if isinstance(node.handle, FlaxHandle) and node.handle.path in attended
+        else node
+        for node in nodes
+    ]
 
 
 # ------------------------------------------------------------------ layouts

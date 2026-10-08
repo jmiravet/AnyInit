@@ -16,7 +16,7 @@ import numpy as np
 
 from .backends import Backend, resolve
 from .config import InitConfig
-from .core import analytic, distributions, empirical
+from .core import analytic, distributions, empirical, tying
 from .core.fan import ParamSpec, fan_in
 from .core.graph import ModelGraph, Node, NodeKind
 from .core.moments import MomentState
@@ -37,6 +37,9 @@ def run(model: Any, config: InitConfig, params: Any = None) -> InitReport:
     plan = build_plan(graph)
     profiles = _profiles_for(graph, backend)
     fixed = _fixed_scales(graph, plan, config.gains)
+    tied = tying.find(graph)
+    # Scales the solve propagates but never changes.
+    held = {**fixed, **tying.scales(tied)}
 
     weights = _Weights(backend, graph, config)
     weights.draw()
@@ -48,7 +51,7 @@ def run(model: Any, config: InitConfig, params: Any = None) -> InitReport:
             graph,
             plan,
             profiles,
-            fixed=fixed,
+            fixed=held,
             input_state=input_state,
             centered=config.center,
             distribution=config.distribution,
@@ -60,7 +63,7 @@ def run(model: Any, config: InitConfig, params: Any = None) -> InitReport:
     else:
         problem = None
         initial = {n.id: analytic.default_scale(graph, n.id) for n in graph.scalable}
-        initial.update(fixed)
+        initial.update(held)
         weights.apply_all(initial)
         inputs = _inputs(backend, config)
         result = empirical.solve(
@@ -70,7 +73,7 @@ def run(model: Any, config: InitConfig, params: Any = None) -> InitReport:
             measure=lambda taps: _measure(backend, model, inputs, taps),
             apply_scale=weights.apply,
             initial_scales=initial,
-            fixed=fixed.keys(),
+            fixed=held.keys(),
         )
         weights.apply_all(result.scales)
         measured, counts = result.states, {}
@@ -87,6 +90,7 @@ def run(model: Any, config: InitConfig, params: Any = None) -> InitReport:
         measured=measured,
         counts=counts,
         fixed=fixed,
+        tied=tied,
         params=report_params,
         input_state=input_state,
         measured_input=measured_input,
@@ -284,6 +288,7 @@ def _build_report(
     measured: dict[str, MomentState],
     counts: dict[str, int],
     fixed: Mapping[str, float],
+    tied: Sequence[tying.TiedTable],
     params: Any,
     input_state: MomentState,
     measured_input: bool,
@@ -360,6 +365,7 @@ def _build_report(
         "carry one scale, so the last one solved wins"
         for ids in plan.shared.values()
     )
+    warnings.extend(tying.describe(table, graph) for table in tied)
     missing = [nid for nid, profile in profiles.items() if profile is None]
     if missing:
         warnings.append(

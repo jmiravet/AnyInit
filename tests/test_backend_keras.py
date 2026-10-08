@@ -163,3 +163,35 @@ def test_validation_batch_is_independent_of_the_weights():
     x = np.random.default_rng(12345).standard_normal((4096, width))
     independent = float(np.mean(np.maximum(x @ kernel, 0) ** 2))
     assert report.layers[0].measured == pytest.approx(independent, abs=0.05)
+
+
+class _ReversibleEmbedding(layers.Embedding):
+    """The tied embedding of keras_hub: ``layer(h, reverse=True)`` computes ``h @ table.T``."""
+
+    def call(self, inputs, reverse=False):
+        if reverse:
+            return keras.ops.matmul(inputs, keras.ops.transpose(self.embeddings))
+        return super().call(inputs)
+
+    def compute_output_spec(self, inputs, reverse=False):
+        if reverse:
+            shape = (*inputs.shape[:-1], self.input_dim)
+            return keras.KerasTensor(shape, dtype=self.compute_dtype)
+        return super().compute_output_spec(inputs)
+
+
+def test_reverse_call_ties_the_table_to_the_output_scale():
+    from anyinit.core.tying import DOCS
+
+    idx = keras.Input((32,), dtype="int32")
+    embedding = _ReversibleEmbedding(500, 64)
+    h = layers.LayerNormalization()(layers.Dense(64, activation="relu")(embedding(idx)))
+    model = keras.Model(idx, embedding(h, reverse=True))
+    batch = np.random.default_rng(0).integers(0, 500, (16, 32)).astype("int32")
+    report = anyinit.initialize(model, input_spec=batch, seed=0)
+
+    table = keras.ops.convert_to_numpy(embedding.embeddings)
+    assert table.std() == pytest.approx(64**-0.5, rel=1e-2)
+    logits = keras.ops.convert_to_numpy(model(batch))
+    assert logits.var() == pytest.approx(1.0, rel=0.1)
+    assert any(DOCS in w for w in report.warnings)

@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- An embedding table tied to the output layer was scaled as a lookup alone, which leaves
+  the logits at standard deviation √d_model and an initial loss that grows with width. A
+  PyTorch model with a `Linear` head escaped only because the head was written last, and
+  the report said nothing either way. Tied tables are now detected (a shared `Parameter`,
+  or `F.linear` and `@` on an embedding's weight, in PyTorch; `Embed.attend` in Flax;
+  `reverse=True` calls in Keras), given the output layer's scale, held at it through the
+  solve, and reported. The measurements behind the choice are in the docs.
+- Keras: a subclass of `Embedding` was laid out as a dense kernel.
+
 ## 0.2.0
 
 ### Fixed

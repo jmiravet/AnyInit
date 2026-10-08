@@ -104,4 +104,5 @@ silently.
 | Canonical shapes and fan arithmetic | `core/fan.py` |
 | Weight samplers | `core/distributions.py` |
 | Solvers | `core/analytic.py`, `core/empirical.py` |
+| Embedding tables tied to the output layer | `core/tying.py` |
 | Orchestration | `_run.py` |

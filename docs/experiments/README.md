@@ -19,3 +19,6 @@ python docs/experiments/stability_table.py
 ```
 
 `depth_sweep.py`, `draw_drift.py` and `gain_table.py` need PyTorch; the others need only NumPy.
+
+[Tied embeddings](tied-embeddings.md) keeps its script inline instead: it needs a GPU and a
+dataset, and it justifies one decision rather than a figure.
