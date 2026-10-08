@@ -75,7 +75,8 @@ def describe(table: TiedTable, graph: ModelGraph) -> str:
         f"would take 1; it was given the output's scale, so looked-up rows have "
         f"E[x^2] = {table.scale**2:.3g}. Unless forward() already multiplies them by "
         f"sqrt({d}), as Gemma and the original Transformer do, doing so restores unit "
-        f"variance without touching the logits; see {DOCS}"
+        f"variance without touching the logits. {DOCS} covers this and the table's "
+        "learning rate"
     )
 
 

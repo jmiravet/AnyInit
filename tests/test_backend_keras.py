@@ -195,3 +195,18 @@ def test_reverse_call_ties_the_table_to_the_output_scale():
     logits = keras.ops.convert_to_numpy(model(batch))
     assert logits.var() == pytest.approx(1.0, rel=0.1)
     assert any(DOCS in w for w in report.warnings)
+
+
+def test_reverse_call_on_an_untied_table_is_not_tying():
+    """``tie_weights=False`` gives the reverse call a table of its own."""
+
+    class Untied(_ReversibleEmbedding):
+        tie_weights = False
+
+    idx = keras.Input((32,), dtype="int32")
+    embedding = Untied(500, 64)
+    model = keras.Model(idx, embedding(layers.LayerNormalization()(embedding(idx)), reverse=True))
+    batch = np.random.default_rng(0).integers(0, 500, (16, 32)).astype("int32")
+    report = anyinit.initialize(model, input_spec=batch, seed=0)
+
+    assert not any("tied embedding" in w for w in report.warnings)

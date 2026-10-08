@@ -36,12 +36,129 @@ rate sweep, mean of 2 seeds. The rest of the network is initialized identically 
 - The output role dominates the gradient. The norm of the input-side gradient falls from
   0.6 of the output side at initialization to 0.01–0.5 by step 100, as Lopardo et al.
   report.
-- AnyInit writes weights, not code. It gives the table the output's scale (F), which
-  becomes C when the model already multiplies the lookup by √d. A logit multiplier, as in
-  PaLM and T5, is invisible to it; the logits then start at standard deviation 1/√d. The
-  report suggests the √d multiplier.
 
 The models are small and short-trained; differences under 0.05 nats are within seed noise.
+
+**Recommendations.** AnyInit sets the table's scale. Two things that matter as much are
+out of its reach: a multiplier in the forward pass, which is architecture, and the table's
+learning rate, which is the optimizer's.
+
+*1. Multiply the lookup by √d.* This is C, the best tied variant measured. With it the
+scale AnyInit writes gives the lookup unit variance and leaves the logits alone. A model
+that scales the logits by 1/√d instead (PaLM, T5) starts them at standard deviation 1/√d
+under AnyInit, which cannot see that multiplier; moving it to the lookup fixes that.
+
+The analytic mode does not see a constant multiplier on the lookup either. In a pre-norm
+Transformer every reader of the lookup normalizes it first, so the solved scales come out
+the same. Where a layer reads the lookup directly, use `mode="empirical"`; otherwise the
+report's validation line shows the gap.
+
+PyTorch:
+
+```python
+import math
+
+from torch import nn
+
+
+class TiedLM(nn.Module):
+    def __init__(self, vocab: int, d: int, blocks: nn.Module):
+        super().__init__()
+        self.emb = nn.Embedding(vocab, d)
+        self.blocks = blocks
+        self.norm = nn.LayerNorm(d)
+        self.head = nn.Linear(d, vocab, bias=False)
+        self.head.weight = self.emb.weight
+        self.lookup_scale = math.sqrt(d)
+
+    def forward(self, idx):
+        h = self.blocks(self.emb(idx) * self.lookup_scale)
+        return self.head(self.norm(h))
+```
+
+Flax:
+
+```python
+import flax.linen as nn
+import jax.numpy as jnp
+
+
+class TiedLM(nn.Module):
+    vocab: int
+    d: int
+    blocks: nn.Module
+
+    @nn.compact
+    def __call__(self, idx):
+        emb = nn.Embed(self.vocab, self.d)
+        h = self.blocks(emb(idx) * jnp.sqrt(self.d))
+        return emb.attend(nn.LayerNorm()(h))
+```
+
+Keras, with keras_hub's tied embedding:
+
+```python
+import math
+
+import keras
+import keras_hub
+
+ids = keras.Input((None,), dtype="int32")
+embedding = keras_hub.layers.ReversibleEmbedding(vocab, d)
+h = blocks(embedding(ids) * math.sqrt(d))
+logits = embedding(keras.layers.LayerNormalization()(h), reverse=True)
+model = keras.Model(ids, logits)
+```
+
+*2. Match the table's learning rate to its scale.* Adam's step does not depend on a
+parameter's size, so what moves the table is the learning rate relative to its scale. At
+the 1/√d AnyInit writes, use the rate of the rest of the model. A table kept at σ = 1, as
+in the PaLM and T5 recipes or when it is reinitialized after AnyInit, needs √d times that
+rate (D′); PaLM gets the same from Adafactor's parameter scaling. Under a schedule, keep
+the ratio. The snippets are for that σ = 1 case.
+
+PyTorch, where a tied table is listed once among the parameters:
+
+```python
+lr, d = 3e-3, model.emb.embedding_dim
+table = model.emb.weight
+rest = [p for p in model.parameters() if p is not table]
+optimizer = torch.optim.AdamW([{"params": rest}, {"params": [table], "lr": lr * d**0.5}], lr=lr)
+```
+
+Flax, with optax:
+
+```python
+import optax
+from flax import traverse_util
+
+lr, d = 3e-3, 512
+
+
+def labels(params):
+    flat = traverse_util.flatten_dict(params)
+    return traverse_util.unflatten_dict(
+        {path: "table" if path[-1] == "embedding" else "rest" for path in flat}
+    )
+
+
+optimizer = optax.multi_transform(
+    {"rest": optax.adamw(lr), "table": optax.adamw(lr * d**0.5)}, labels
+)
+```
+
+Keras (checked with 3.15):
+
+```python
+lr = 3e-3
+table, rest = keras.optimizers.AdamW(lr * d**0.5), keras.optimizers.AdamW(lr)
+optimizer = keras.optimizers.MultiOptimizer(
+    lambda variable: table if variable is embedding.embeddings else rest
+)
+```
+
+*3. Or untie.* The untied model (E) matched C at d = 512 for V·d more parameters, and
+AnyInit scales both of its tables correctly without help.
 
 **References.**
 

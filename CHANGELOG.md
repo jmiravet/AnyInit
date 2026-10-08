@@ -9,8 +9,10 @@
   PyTorch model with a `Linear` head escaped only because the head was written last, and
   the report said nothing either way. Tied tables are now detected (a shared `Parameter`,
   or `F.linear` and `@` on an embedding's weight, in PyTorch; `Embed.attend` in Flax;
-  `reverse=True` calls in Keras), given the output layer's scale, held at it through the
-  solve, and reported. The measurements behind the choice are in the docs.
+  `reverse=True` calls of a tied `ReversibleEmbedding` in Keras), given the output layer's
+  scale, held at it through the solve, and reported. The docs give the measurements behind
+  the choice and what to do beyond initialization: a √d multiplier on the lookup, and the
+  table's learning rate.
 - Keras: a subclass of `Embedding` was laid out as a dense kernel.
 
 ## 0.2.0

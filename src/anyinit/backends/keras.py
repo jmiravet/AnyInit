@@ -655,8 +655,9 @@ def _reverse_calls(layer: Any) -> list[Any]:
 
     Keras has no tying of its own; ``keras_hub.layers.ReversibleEmbedding`` is the usual
     way, called a second time as ``layer(h, reverse=True)`` to compute ``h @ table.T``.
+    With ``tie_weights=False`` that call reads a second table of its own instead.
     """
-    if not _is_embedding(layer):
+    if not _is_embedding(layer) or not getattr(layer, "tie_weights", True):
         return []
     return [
         call
