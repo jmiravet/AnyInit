@@ -18,6 +18,7 @@ from anyinit.core.transfer import (
     through_linear,
     through_merge,
     through_normalization,
+    through_scale,
 )
 
 UNIT = MomentState.standard_normal()
@@ -126,3 +127,20 @@ def test_heavy_tailed_input_triggers_the_mixture_correction():
     plain = through_activation(heavy, profile)  # no layer given: plain Gaussian
     corrected = through_activation(heavy, profile, fan=spec_fan, sigma_w=sigma)
     assert corrected.m2 > plain.m2
+
+
+def test_scale_by_a_number_is_exact():
+    state = through_scale(MomentState(0.5, 2.0, 12.0), MomentState.of_values(3.0))
+    assert (state.mean, state.m2, state.m4) == pytest.approx((1.5, 18.0, 972.0))
+
+
+def test_scale_by_an_array_acts_through_its_root_mean_square():
+    state = through_scale(UNIT, MomentState.of_values([1.0, 3.0]))
+    assert state.m2 == pytest.approx(5.0)
+    assert state.kurtosis_of_square == pytest.approx(3.0)
+
+
+def test_scale_with_an_offset_shifts_the_mean():
+    state = through_scale(UNIT, MomentState.of_values(2.0), offset=1.0)
+    assert state.mean == pytest.approx(1.0)
+    assert state.m2 == pytest.approx(5.0)

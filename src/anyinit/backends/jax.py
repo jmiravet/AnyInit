@@ -119,6 +119,7 @@ class FlaxBackend(Backend):
         self._trace: list[tuple[int, str, str, tuple[str, ...]]] = []
         self._inferred: dict[int, str] = {}
         self._superseded: set[int] = set()
+        self._scales: dict[int, float] = {}
         self._output_leaf: int | None = None
         self.last_counts: dict[str, int] = {}
 
@@ -235,6 +236,8 @@ class FlaxBackend(Backend):
         them, the transform is matched against the known and registered activations, and
         what it identifies takes the place of what was recorded.  A registered function
         that calls ``jnp.tanh`` inside is caught this way, rather than taken for ``tanh``.
+        A transform that matches no activation is tried as a constant factor, such as the
+        ``sqrt(d_model)`` a language model multiplies its lookup by, kept in ``_scales``.
 
         ``final`` holds the leaves of the model's output, which stands in for a layer after
         the last one, so an activation applied last is caught too.  Returns the
@@ -244,6 +247,7 @@ class FlaxBackend(Backend):
         found: dict[int, str] = {}
         notes: list[str] = []
         self._superseded = set()
+        self._scales = {}
         self._output_leaf = None
         layers = [entry for entry in self._trace if entry[1] in ("layer", "norm")]
         if final:
@@ -273,6 +277,10 @@ class FlaxBackend(Backend):
                     verdict = ""  # genuinely linear between the two layers
                 else:
                     verdict = self._identify(z, x)
+                    factor = None if verdict else _scalar_ratio(z if last is None else last, x)
+                    if factor is not None:
+                        self._scales[current[0]] = factor
+                        verdict = ""
                 if verdict is None:
                     continue
                 if current[0] == _MODEL_OUTPUT:
@@ -347,7 +355,10 @@ class FlaxBackend(Backend):
                     )
                 )
                 previous = nodes[-1].id
-            nid = "/".join(path) if path else f"{op}_{index}"
+            if index in self._scales:
+                nodes.append(_scale_node(index, self._scales[index], previous))
+                previous = nodes[-1].id
+            nid = _trace_id(index, op, path)
             if kind == "activation":
                 canonical = _CANONICAL.get(op, op)
                 nodes.append(
@@ -383,6 +394,8 @@ class FlaxBackend(Backend):
                             meta={"path": nid, "trace_index": index, "affine": False},
                         )
                     )
+            elif op == _ATTEND:
+                nodes.append(_tied_readout(nid, path, previous, index, self._flat))
             else:
                 spec_kind, param_name = _LAYERS[op]
                 weight_path = (*path, param_name)
@@ -425,9 +438,12 @@ class FlaxBackend(Backend):
                 )
             )
             previous = nodes[-1].id
+        if _MODEL_OUTPUT in self._scales:
+            nodes.append(_scale_node(_MODEL_OUTPUT, self._scales[_MODEL_OUTPUT], previous))
+            previous = nodes[-1].id
         nodes.append(Node("output", NodeKind.OUTPUT, "output", (previous,)))
         return ModelGraph(
-            nodes,
+            _mark_tied(nodes),
             fidelity=FIDELITY_LINEAR,
             notes=(
                 "the JAX backend recovers call order, not graph structure, so residual "
@@ -503,6 +519,7 @@ class FlaxBackend(Backend):
         recorder = TapRecorder()
         index_to_id = dict(self._trace_ids())
         input_to_id = {index: _inferred_id(name, index) for index, name in self._inferred.items()}
+        input_to_id.update({index: _inferred_id("scale", index) for index in self._scales})
 
         def record(table: dict[int, str], index: int, value: Any) -> None:
             nid = table.get(index)
@@ -525,7 +542,7 @@ class FlaxBackend(Backend):
 
     def _trace_ids(self) -> Iterator[tuple[int, str]]:
         for index, _kind, op, path in self._trace:
-            yield index, ("/".join(path) if path else f"{op}_{index}")
+            yield index, _trace_id(index, op, path)
 
     # --------------------------------------------------------------- lifecycle
 
@@ -589,9 +606,9 @@ def _instrumented(
         trace.append((index, kind, op, path))
         return index
 
-    def wrap_layer(cls: Any, op: str, kind: str) -> None:
-        original = cls.__call__
-        saved.append((cls, "__call__", original))
+    def wrap_layer(cls: Any, op: str, kind: str, method: str = "__call__") -> None:
+        original = getattr(cls, method)
+        saved.append((cls, method, original))
 
         def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
             if depth[0]:
@@ -612,7 +629,7 @@ def _instrumented(
                 observe(index, out)
             return out
 
-        cls.__call__ = wrapper
+        setattr(cls, method, wrapper)
 
     def wrap_function(holder: Any, attr: str) -> None:
         original = getattr(holder, attr, None)
@@ -640,6 +657,7 @@ def _instrumented(
             cls = getattr(nn, op, None)
             if cls is not None:
                 wrap_layer(cls, op, "layer")
+        wrap_layer(nn.Embed, _ATTEND, "layer", method="attend")
         for op in _NORMS:
             cls = getattr(nn, op, None)
             if cls is not None:
@@ -691,6 +709,13 @@ _MODEL_OUTPUT = -1
 _WEIGHT_NAMES = frozenset(name for _, name in _LAYERS.values())
 
 
+def _trace_id(index: int, op: str, path: tuple[str, ...]) -> str:
+    """Node id of a traced call: its parameter path, or its op where it has none."""
+    base = "/".join(path) if path else f"{op}_{index}"
+    # attend() runs under the same scope as the lookup, so the path alone would collide.
+    return f"{base}/attend" if op == _ATTEND else base
+
+
 def _inferred_id(name: str, index: int) -> str:
     """Node id of an activation identified from values, by the layer it feeds."""
     return f"{name}_before_{'output' if index == _MODEL_OUTPUT else index}"
@@ -717,12 +742,76 @@ def _close(a: np.ndarray, b: np.ndarray) -> bool:
     return bool(np.allclose(a, b, rtol=1e-5, atol=1e-6 * scale))
 
 
+def _scalar_ratio(base: np.ndarray, x: np.ndarray) -> float | None:
+    """``c`` when ``x`` is ``c * base`` to working precision, else ``None``."""
+    base = np.asarray(base, dtype=np.float64).ravel()
+    x = np.asarray(x, dtype=np.float64).ravel()
+    norm = float(base @ base)
+    if base.shape != x.shape or norm == 0.0:
+        return None
+    factor = float(base @ x) / norm
+    return factor if _close(factor * base, x) else None
+
+
+def _scale_node(index: int, factor: float, previous: str) -> Node:
+    """A constant factor read off the probe, applied before the layer at ``index``."""
+    return Node(
+        _inferred_id("scale", index),
+        NodeKind.SCALE,
+        "scale",
+        (previous,),
+        meta={"factor": MomentState.of_values(factor), "input_of": index},
+    )
+
+
 def _holder_of(fn: Any) -> Any:
     """Return the module a registered function lives in, so it can be patched in place."""
     import sys
 
     module_name = getattr(fn, "__module__", None)
     return sys.modules.get(module_name) if module_name else None
+
+
+# ------------------------------------------------------------ tied tables
+
+#: Trace op of ``nn.Embed.attend``, the embedding's table used as the output layer.
+_ATTEND = "Embed.attend"
+
+
+def _tied_readout(
+    nid: str,
+    path: tuple[str, ...],
+    previous: str,
+    index: int,
+    flat: dict[tuple[str, ...], np.ndarray],
+) -> Node:
+    """``Embed.attend(h)``, which is ``h @ table.T``: a dense layer on the lookup's table."""
+    table = (*path, "embedding")
+    return Node(
+        nid,
+        NodeKind.PARAMETRIC,
+        _ATTEND,
+        (previous,),
+        spec=fanmod.ParamSpec(fanmod.DENSE, tuple(int(s) for s in flat[table].shape)),
+        # Stored (vocab, d_model), which is already (fan_out, fan_in): no transpose.
+        handle=FlaxHandle(table, fanmod.EMBEDDING),
+        meta={"path": nid, "trace_index": index},
+    )
+
+
+def _mark_tied(nodes: list[Node]) -> list[Node]:
+    """Key the lookup and the ``attend`` of one table alike, for :mod:`anyinit.core.tying`."""
+    attended = {
+        node.handle.path
+        for node in nodes
+        if node.op == _ATTEND and isinstance(node.handle, FlaxHandle)
+    }
+    return [
+        node.with_meta(tied="/".join(node.handle.path))
+        if isinstance(node.handle, FlaxHandle) and node.handle.path in attended
+        else node
+        for node in nodes
+    ]
 
 
 # ------------------------------------------------------------------ layouts

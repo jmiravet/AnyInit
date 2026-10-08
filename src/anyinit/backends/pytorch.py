@@ -25,6 +25,10 @@ from ..core.registry import ActivationRef
 from ..errors import TraceError
 from .base import Backend, TapRecorder, module_roots
 
+#: Names of the calls that multiply or divide, as functions and as tensor methods.
+_MULTIPLY_NAMES = frozenset({"mul", "imul", "mul_", "multiply"})
+_DIVIDE_NAMES = frozenset({"truediv", "itruediv", "div", "div_", "divide", "true_divide"})
+
 #: Normalization layer class names, matched by name so a class missing from an older torch
 #: release is simply absent.
 _NORM_NAMES = frozenset(
@@ -327,12 +331,18 @@ class TorchBackend(Backend):
 
         for fx_node in graph_module.graph.nodes:
             inputs = tuple(emitted[n.name] for n in fx_node.all_input_nodes if n.name in emitted)
-            built = self._classify(fx_node, graph_module, inputs, native_calls, leaf_types)
+            readout = _tied_readout(fx_node, model, graph_module, emitted)
+            built = (
+                [readout]
+                if readout is not None
+                else self._classify(fx_node, graph_module, inputs, native_calls, leaf_types)
+            )
             nodes.extend(built)
             emitted[fx_node.name] = (
                 built[-1].id if built else (inputs[0] if inputs else fx_node.name)
             )
             self._node_names[fx_node.name] = emitted[fx_node.name]
+        nodes = _mark_tied(nodes)
 
         # Nodes expanded out of a container module have no FX node of their own; they are
         # read through hooks on the submodule that produces or consumes them.
@@ -417,6 +427,12 @@ class TorchBackend(Backend):
                     meta={"activation": ActivationRef(custom)},
                 )
             ]
+
+        scaled = _constant_factor(fx_node, graph_module)
+        if scaled is not None:
+            factor, constant = scaled
+            signal = tuple(i for i in inputs if i != constant)
+            return [Node(nid, NodeKind.SCALE, name, signal, meta={"factor": factor})]
 
         if fx_node.op == "call_function" and target in _MERGE_FUNCTIONS:
             op = _MERGE_FUNCTIONS[target]
@@ -772,7 +788,7 @@ class TorchBackend(Backend):
 
         nodes.append(Node("output", NodeKind.OUTPUT, "output", (previous,)))
         return ModelGraph(
-            nodes,
+            _mark_tied(nodes),
             fidelity=FIDELITY_LINEAR,
             notes=(
                 f"torch.fx could not trace this model ({reason}); fell back to module "
@@ -981,6 +997,133 @@ class TorchBackend(Backend):
             batch = torch.randn(tuple(input_spec), generator=generator)
             return batch if self._device is None else batch.to(self._device, self._dtype)
         return input_spec
+
+
+# ------------------------------------------------------------- constants
+
+
+def _constant_factor(fx_node: Any, graph_module: Any) -> tuple[MomentState, str | None] | None:
+    """The constant a call multiplies its one tensor input by, when it can be read.
+
+    A number written in ``forward()`` is a literal in the traced call; a buffer or
+    parameter is read off the module.  Returns the constant's moments and, for a tensor,
+    the name of the node that fetched it, which is not a signal input.  ``None`` for a
+    product of two computed tensors, which is a merge, and for a division by anything but
+    a number or a one-element tensor.
+    """
+    from torch import fx
+
+    name = getattr(fx_node.target, "__name__", str(fx_node.target))
+    divide = name in _DIVIDE_NAMES
+    if fx_node.op not in ("call_function", "call_method") or not (
+        divide or name in _MULTIPLY_NAMES
+    ):
+        return None
+    if len(fx_node.args) != 2 or fx_node.kwargs:
+        return None
+
+    left, right = fx_node.args
+    if isinstance(left, fx.Node) and left.op != "get_attr":
+        operand = right
+    elif not divide:
+        operand = left  # c * x
+    else:
+        return None  # c / x is not a scaling
+
+    if isinstance(operand, (int, float)) and not isinstance(operand, bool):
+        constant = np.asarray(float(operand))
+    elif isinstance(operand, fx.Node) and operand.op == "get_attr":
+        tensor = graph_module
+        for part in str(operand.target).split("."):
+            tensor = getattr(tensor, part)
+        constant = tensor.detach().to("cpu").double().numpy()
+    else:
+        return None  # a computed tensor: a merge
+
+    if divide:
+        if constant.size != 1 or float(constant.ravel()[0]) == 0.0:
+            return None
+        constant = 1.0 / constant
+    fetched = operand.name if isinstance(operand, fx.Node) else None
+    return MomentState.of_values(constant), fetched
+
+
+# ------------------------------------------------------------ tied tables
+
+
+def _tied_readout(
+    fx_node: Any, model: Any, graph_module: Any, emitted: dict[str, str]
+) -> Node | None:
+    """An output layer written as a product with an embedding's table.
+
+    ``F.linear(h, emb.weight)`` and ``h @ emb.weight.T`` use the table without a module of
+    their own, so without this they would pass for an opaque function and the table would
+    be scaled as a lookup alone.  A ``Linear`` head that shares the table is an ordinary
+    layer and needs nothing here; :func:`_mark_tied` finds both.
+    """
+    from torch import fx
+
+    name = getattr(fx_node.target, "__name__", str(fx_node.target))
+    if fx_node.op not in ("call_function", "call_method") or name not in ("linear", "matmul"):
+        return None
+    if len(fx_node.args) < 2 or not isinstance(fx_node.args[0], fx.Node):
+        return None
+    source, weight = fx_node.args[0], fx_node.args[1]
+    transposed = isinstance(weight, fx.Node) and (
+        (weight.op == "call_method" and weight.target in ("t", "transpose"))
+        or (weight.op == "call_function" and weight.target is getattr and weight.args[1] == "T")
+    )
+    if transposed:
+        weight = weight.args[0]
+    # linear(h, W) computes h @ W.T itself; a matmul has to be given the transpose.
+    if transposed != (name == "matmul") or getattr(weight, "op", None) != "get_attr":
+        return None
+    if source.name not in emitted:
+        return None
+
+    table = graph_module
+    for part in str(weight.target).split("."):
+        table = getattr(table, part)
+    owner = next(
+        (
+            (path, module)
+            for path, module in model.named_modules()
+            if type(module).__name__.startswith("Embedding") and module.weight is table
+        ),
+        None,
+    )
+    if owner is None:
+        return None
+    path, module = owner
+    return Node(
+        fx_node.name,
+        NodeKind.PARAMETRIC,
+        name,
+        (emitted[source.name],),
+        spec=fanmod.ParamSpec(fanmod.DENSE, tuple(int(s) for s in table.shape)),
+        handle=TorchHandle(module, "weight"),
+        meta={"path": f"{path}.T"},
+    )
+
+
+def _mark_tied(nodes: list[Node]) -> list[Node]:
+    """Key every node reading an embedding's table, when more than one reads it.
+
+    Tying assigns one ``Parameter`` to two modules, so it shows in the tensor, not in the
+    module.  :mod:`anyinit.core.tying` decides what the table gets.
+    """
+    readers: dict[int, list[int]] = {}
+    for position, node in enumerate(nodes):
+        if node.kind is NodeKind.PARAMETRIC and isinstance(node.handle, TorchHandle):
+            readers.setdefault(id(node.handle.tensor), []).append(position)
+
+    marked = list(nodes)
+    for key, positions in readers.items():
+        group = [nodes[p] for p in positions]
+        if len(group) > 1 and any(n.spec and n.spec.kind == fanmod.EMBEDDING for n in group):
+            for position in positions:
+                marked[position] = nodes[position].with_meta(tied=f"tensor:{key}")
+    return marked
 
 
 # ------------------------------------------------------------------ helpers

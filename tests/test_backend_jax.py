@@ -274,3 +274,55 @@ def test_field_activation_is_identified_whatever_the_incoming_weights_and_output
     params = model.init(jax.random.key(0), x[:1])
     _, report = anyinit.initialize_params(model, params, x, seed=0)
     assert [r.activation for r in report.layers] == ["relu"] * 30
+
+
+class _TiedLM(nn.Module):
+    @nn.compact
+    def __call__(self, idx):
+        emb = nn.Embed(500, 64)
+        h = nn.LayerNorm()(jax.nn.relu(nn.Dense(64)(emb(idx))))
+        return emb.attend(h)
+
+
+def test_attend_ties_the_table_to_the_output_scale():
+    from anyinit.core.tying import DOCS
+
+    model = _TiedLM()
+    idx = jnp.asarray(np.random.default_rng(0).integers(0, 500, (16, 32)))
+    params = model.init(jax.random.key(0), idx)
+    params, report = anyinit.initialize_params(model, params, idx, seed=0)
+
+    table = np.asarray(params["params"]["Embed_0"]["embedding"])
+    assert table.std() == pytest.approx(64**-0.5, rel=1e-2)
+    assert float(model.apply(params, idx).var()) == pytest.approx(1.0, rel=0.1)
+    assert any(DOCS in w for w in report.warnings)
+
+
+class _ScaledLookup(nn.Module):
+    @nn.compact
+    def __call__(self, idx):
+        return jax.nn.relu(nn.Dense(64)(nn.Embed(500, 64)(idx) * 8.0))
+
+
+class _PaLMHead(nn.Module):
+    @nn.compact
+    def __call__(self, idx):
+        emb = nn.Embed(500, 64)
+        return emb.attend(nn.LayerNorm()(jax.nn.relu(nn.Dense(64)(emb(idx))))) * 64**-0.5
+
+
+def test_a_constant_factor_is_read_off_the_probe():
+    model = _ScaledLookup()
+    idx = jnp.asarray(np.random.default_rng(0).integers(0, 500, (64, 32)))
+    params, _report = anyinit.initialize_params(model, model.init(jax.random.key(0), idx), idx)
+    assert float((model.apply(params, idx) ** 2).mean()) == pytest.approx(1.0, rel=0.1)
+
+
+def test_a_logit_multiplier_gives_the_tied_table_a_scale_of_one():
+    model = _PaLMHead()
+    idx = jnp.asarray(np.random.default_rng(0).integers(0, 500, (16, 32)))
+    params, _report = anyinit.initialize_params(model, model.init(jax.random.key(0), idx), idx)
+
+    table = np.asarray(params["params"]["Embed_0"]["embedding"])
+    assert table.std() == pytest.approx(1.0, rel=1e-2)
+    assert float(model.apply(params, idx).var()) == pytest.approx(1.0, rel=0.1)

@@ -37,6 +37,25 @@ def through_linear(
     return MomentState(0.0, var, 3.0 * var * var)
 
 
+def through_scale(state_in: MomentState, factor: MomentState, offset: float = 0.0) -> MomentState:
+    """Moments of ``factor * a + offset``, for a constant ``factor``.
+
+    ``factor`` holds the constant's moments.  A number is exact.  An array broadcast over
+    the signal acts through its mean and root mean square, which keeps the signal's shape:
+    exact for a homogeneous activation after it, and it does not make a per-channel scale
+    look like a heavy tail.  An offset shifts the mean; the fourth moment is then matched
+    to a Gaussian.
+    """
+    mean = state_in.mean * factor.mean
+    m2 = state_in.m2 * factor.m2
+    if offset == 0.0:
+        return MomentState(mean, m2, state_in.m4 * factor.m2 * factor.m2)
+    m2 += 2.0 * offset * mean + offset * offset
+    mean += offset
+    var = max(m2 - mean * mean, 0.0)
+    return MomentState(mean, m2, 3.0 * var * var + 6.0 * var * mean * mean + mean**4)
+
+
 def through_embedding(sigma_w: float) -> MomentState:
     """Moments of an embedding lookup.
 

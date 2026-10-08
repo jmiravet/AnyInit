@@ -241,3 +241,130 @@ def test_initializing_does_not_load_dynamo():
     )
     proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr
+
+
+class _TiedLM(nn.Module):
+    """An embedding whose table is also the output layer, written one of four ways."""
+
+    def __init__(self, head: str, vocab: int = 500, width: int = 64):
+        super().__init__()
+        self.form = head
+        self.emb = nn.Embedding(vocab, width)
+        self.fc = nn.Linear(width, width)
+        self.norm = nn.LayerNorm(width)
+        if head == "module":
+            self.head = nn.Linear(width, vocab, bias=False)
+            self.head.weight = self.emb.weight
+
+    def forward(self, idx):
+        h = self.norm(torch.relu(self.fc(self.emb(idx))))
+        if self.form == "module":
+            return self.head(h)
+        if self.form == "linear":
+            return torch.nn.functional.linear(h, self.emb.weight)
+        if self.form == "T":
+            return h @ self.emb.weight.T
+        return torch.matmul(h, self.emb.weight.t())
+
+
+@pytest.mark.parametrize("head", ["module", "linear", "T", "t"])
+@pytest.mark.parametrize("mode", ["analytic", "empirical"])
+def test_tied_table_takes_the_output_scale(head, mode):
+    from anyinit.core.tying import DOCS
+
+    model = _TiedLM(head)
+    idx = torch.randint(0, 500, (16, 32), generator=torch.Generator().manual_seed(0))
+    report = anyinit.initialize(model, mode, input_spec=idx, seed=0)
+
+    assert float(model.emb.weight.detach().std()) == pytest.approx(64**-0.5, rel=1e-2)
+    with torch.no_grad():
+        assert float(model(idx).var()) == pytest.approx(1.0, rel=0.1)
+    assert any(DOCS in w for w in report.warnings)
+
+
+def test_untied_embedding_keeps_the_lookup_scale():
+    model = _TiedLM("module")
+    model.head.weight = nn.Parameter(torch.empty(500, 64))
+    report = anyinit.initialize(model, seed=0)
+
+    assert float(model.emb.weight.detach().std()) == pytest.approx(1.0, rel=1e-2)
+    assert not any("tied embedding" in w for w in report.warnings)
+
+
+class _Scaled(nn.Module):
+    """``Linear -> times 4 -> ReLU -> Linear``, the factor written one of several ways."""
+
+    def __init__(self, form: str):
+        super().__init__()
+        self.form = form
+        self.fc, self.out = nn.Linear(64, 64), nn.Linear(64, 10)
+        self.register_buffer("four", torch.tensor(4.0))
+
+    def forward(self, x):
+        h = self.fc(x)
+        h = {
+            "x * c": lambda: h * 4.0,
+            "c * x": lambda: 4.0 * h,
+            "x / c": lambda: h / 0.25,
+            "x.mul(c)": lambda: h.mul(4.0),
+            "buffer": lambda: h * self.four,
+        }[self.form]()
+        return self.out(torch.relu(h))
+
+
+@pytest.mark.parametrize("form", ["x * c", "c * x", "x / c", "x.mul(c)", "buffer"])
+def test_a_constant_factor_is_solved_around(form):
+    model = _Scaled(form)
+    report = anyinit.initialize(model, input_spec=(1024, 64), seed=0)
+
+    assert report.layers[0].scale == pytest.approx((2.0 / 64) ** 0.5 / 4.0)
+    report.assert_healthy()
+
+
+def test_a_per_channel_constant_is_solved_around():
+    class LayerScale(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fc, self.out = nn.Linear(64, 64), nn.Linear(64, 10)
+            self.gamma = nn.Parameter(torch.linspace(1.0, 3.0, 64))
+
+        def forward(self, x):
+            return self.out(torch.relu(self.fc(x) * self.gamma))
+
+    model = LayerScale()
+    report = anyinit.initialize(model, input_spec=(1024, 64), seed=0)
+    report.assert_healthy()
+
+
+def test_a_lookup_multiplier_reaches_the_layer_reading_it():
+    """``emb(idx) * sqrt(d)`` feeding a layer with no normalization in between."""
+
+    class Net(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.emb, self.fc = nn.Embedding(500, 64), nn.Linear(64, 64)
+
+        def forward(self, idx):
+            return torch.relu(self.fc(self.emb(idx) * 8.0))
+
+    model = Net()
+    idx = torch.randint(0, 500, (64, 32), generator=torch.Generator().manual_seed(0))
+    anyinit.initialize(model, input_spec=idx, seed=0)
+    with torch.no_grad():
+        assert float(model(idx).pow(2).mean()) == pytest.approx(1.0, rel=0.1)
+
+
+def test_a_logit_multiplier_gives_the_tied_table_a_scale_of_one():
+    """PaLM: logits times 1/sqrt(d) let one scale serve both roles."""
+
+    class PaLMHead(_TiedLM):
+        def forward(self, idx):
+            return super().forward(idx) * 64**-0.5
+
+    model = PaLMHead("module")
+    idx = torch.randint(0, 500, (16, 32), generator=torch.Generator().manual_seed(0))
+    anyinit.initialize(model, input_spec=idx, seed=0)
+
+    assert float(model.emb.weight.detach().std()) == pytest.approx(1.0, rel=1e-2)
+    with torch.no_grad():
+        assert float(model(idx).var()) == pytest.approx(1.0, rel=0.1)

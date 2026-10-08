@@ -44,6 +44,7 @@ nav:
   - Design: design.md
   - Contributing: contributing.md
   - Reproducing the measurements: experiments/README.md
+  - Tied embeddings: experiments/tied-embeddings.md
   - Changelog: changelog.md
 
 markdown_extensions:

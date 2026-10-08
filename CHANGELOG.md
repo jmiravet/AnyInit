@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- An embedding table tied to the output layer was scaled as a lookup alone, which leaves
+  the logits at standard deviation √d_model and an initial loss that grows with width. A
+  PyTorch model with a `Linear` head escaped only because the head was written last, and
+  the report said nothing either way. Tied tables are now detected (a shared `Parameter`,
+  or `F.linear` and `@` on an embedding's weight, in PyTorch; `Embed.attend` in Flax;
+  `reverse=True` calls of a tied `ReversibleEmbedding` in Keras), given the output layer's
+  scale, held at it through the solve, and reported. The docs give the measurements behind
+  the choice and what to do beyond initialization: a √d multiplier on the lookup, and the
+  table's learning rate.
+- A multiplication by a constant was taken for the identity by the analytic mode, so the
+  layer reading it was scaled for the wrong input: `x * c`, `c * x`, `x / c` and scalar or
+  per-channel buffers and parameters in PyTorch, `x * c` and `Rescaling` in Keras, and in
+  Flax any scalar factor, which the report called a transform it could not identify. Such
+  factors are now read and propagated, and the table of a tied embedding counts the ones
+  around the output layer, so a model that scales its logits by 1/√d gets a table of 1.
+- Keras: an operation holding a constant, such as `x * 2.0` in a functional model, could
+  not be replayed, so validation and the empirical mode measured nothing after it.
+- Keras: a subclass of `Embedding` was laid out as a dense kernel.
+
 ## 0.2.0
 
 ### Fixed
