@@ -1,11 +1,10 @@
 # AnyInit
 
+[![PyPI Downloads](https://static.pepy.tech/personalized-badge/anyinit?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=GREEN&left_text=downloads)](https://pepy.tech/projects/anyinit)
 [![CI](https://github.com/jmiravet/AnyInit/actions/workflows/ci.yml/badge.svg)](https://github.com/jmiravet/AnyInit/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/jmiravet/AnyInit/graph/badge.svg)](https://codecov.io/gh/jmiravet/AnyInit)
 [![PyPI](https://img.shields.io/pypi/v/anyinit)](https://pypi.org/project/anyinit/)
-[![Python](https://img.shields.io/pypi/pyversions/anyinit)](https://pypi.org/project/anyinit/)
 [![Docs](https://img.shields.io/badge/docs-jmiravet.github.io%2FAnyInit-blue)](https://jmiravet.github.io/AnyInit/)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](https://github.com/jmiravet/AnyInit/blob/main/LICENSE)
 
 Initialize any model, in any framework, correctly — with one call.
 
