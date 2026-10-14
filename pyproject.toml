@@ -12,6 +12,7 @@ license-files = ["LICENSE"]
 authors = [
   { name = "Jose I. Mestre", email = "jmiravet@uji.es" },
   { name = "Alberto Fernández-Hernández", email = "a.fernandez@upv.es" },
+  { name = "Sergio Barrachina", email = "barrachi@uji.es" },
 ]
 maintainers = [{ name = "Jose I. Mestre", email = "jmiravet@uji.es" }]
 requires-python = ">=3.10"
