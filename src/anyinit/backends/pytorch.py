@@ -2,8 +2,9 @@
 
 Traces through ``torch.fx``, which yields a full DAG with residual additions and
 concatenations as nodes.  When symbolic tracing fails -- data-dependent control flow, or
-modules it cannot handle -- the backend falls back to an ordered chain from
-``named_modules`` and marks the graph as linear.
+modules it cannot handle -- the backend falls back to a chain of leaf modules, in the
+order they run on a one-row probe or, failing that, in registration order, and marks the
+graph as linear.
 """
 
 from __future__ import annotations
@@ -66,31 +67,95 @@ _ACTIVATION_MODULES: dict[str, str] = {
     "Hardtanh": "hardtanh",
     "Hardsigmoid": "hardsigmoid",
     "Hardswish": "hardswish",
+    "PReLU": "leaky_relu",
+    "LogSigmoid": "log_sigmoid",
+    "Hardshrink": "hardshrink",
+    "Softshrink": "softshrink",
+    "Tanhshrink": "tanhshrink",
+    "Threshold": "threshold",
     "Softmax": "softmax",
     "LogSoftmax": "log_softmax",
+    "Softmin": "softmin",
+    "GLU": "glu",
+}
+
+#: Activation classes of other libraries, keyed by ``module.qualname`` so that neither
+#: library is imported and a user class that happens to share a name is not mistaken for
+#: one.  FX would otherwise trace into them, since only ``torch.nn`` modules are leaves.
+_THIRD_PARTY_ACTIVATIONS: dict[str, str] = {
+    "transformers.activations.GELUActivation": "gelu",
+    "transformers.activations.GELUTanh": "gelu_tanh",
+    "transformers.activations.NewGELUActivation": "gelu_tanh",
+    "transformers.activations.FastGELUActivation": "gelu_tanh",
+    "transformers.activations.AccurateGELUActivation": "gelu_tanh",
+    "transformers.activations.ClippedGELUActivation": "clipped_gelu",
+    "transformers.activations.QuickGELUActivation": "quick_gelu",
+    "transformers.activations.SiLUActivation": "silu",
+    "transformers.activations.MishActivation": "mish",
+    "transformers.activations.ReLUSquaredActivation": "relu2",
+    "transformers.activations.SqrtSoftplusActivation": "sqrt_softplus",
+    "transformers.activations.LaplaceActivation": "laplace",
+    "transformers.activations.LinearActivation": "identity",
+    "timm.layers.activations.Swish": "silu",
+    "timm.layers.activations.Mish": "mish",
+    "timm.layers.activations.Sigmoid": "sigmoid",
+    "timm.layers.activations.Tanh": "tanh",
+    "timm.layers.activations.HardSwish": "hardswish",
+    "timm.layers.activations.HardSigmoid": "hardsigmoid",
+    "timm.layers.activations.HardMish": "hard_mish",
+    "timm.layers.activations.PReLU": "leaky_relu",
+    "timm.layers.activations.GELU": "gelu",
+    "timm.layers.activations.GELUTanh": "gelu_tanh",
+    "timm.layers.activations.QuickGELU": "quick_gelu",
+    "timm.layers.activations_me.SwishMe": "silu",
+    "timm.layers.activations_me.MishMe": "mish",
+    "timm.layers.activations_me.HardSwishMe": "hardswish",
+    "timm.layers.activations_me.HardSigmoidMe": "hardsigmoid",
+    "timm.layers.activations_me.HardMishMe": "hard_mish",
 }
 
 #: Functional name -> canonical activation name, keyed by ``__name__`` so ``torch.relu``
-#: and ``torch.nn.functional.relu`` resolve alike.
+#: and ``torch.nn.functional.relu`` resolve alike, and so are tensor methods.  In-place
+#: variants compute the same function.
 _ACTIVATION_FUNCTIONS: dict[str, str] = {
     "relu": "relu",
+    "relu_": "relu",
     "relu6": "relu6",
     "leaky_relu": "leaky_relu",
+    "leaky_relu_": "leaky_relu",
+    "rrelu": "leaky_relu",
+    "rrelu_": "leaky_relu",
+    "prelu": "leaky_relu",
     "elu": "elu",
+    "elu_": "elu",
     "selu": "selu",
+    "selu_": "selu",
     "celu": "celu",
+    "celu_": "celu",
     "gelu": "gelu",
     "sigmoid": "sigmoid",
+    "sigmoid_": "sigmoid",
     "silu": "silu",
     "mish": "mish",
     "softplus": "softplus",
     "softsign": "softsign",
     "tanh": "tanh",
+    "tanh_": "tanh",
     "hardtanh": "hardtanh",
+    "hardtanh_": "hardtanh",
     "hardsigmoid": "hardsigmoid",
     "hardswish": "hardswish",
+    "log_sigmoid": "log_sigmoid",
+    "hardshrink": "hardshrink",
+    "softshrink": "softshrink",
+    "tanhshrink": "tanhshrink",
+    "_threshold": "threshold",
+    "threshold": "threshold",
+    "threshold_": "threshold",
     "softmax": "softmax",
     "log_softmax": "log_softmax",
+    "softmin": "softmin",
+    "glu": "glu",
 }
 
 _MERGE_FUNCTIONS = {
@@ -248,10 +313,9 @@ def _unscaled_reason(owner: Any, model: Any) -> str:
 
 def _transformer_activation(activation: Any) -> tuple[str, dict[str, float]]:
     """Canonical name of a transformer layer's activation, which may be a function."""
-    cls = type(activation).__name__
-    if cls in _ACTIVATION_MODULES:
-        canonical = _ACTIVATION_MODULES[cls]
-        return canonical, _module_activation_params(canonical, activation)
+    found = _module_activation(activation)
+    if found is not None:
+        return found
     name = getattr(activation, "__name__", "")
     return _ACTIVATION_FUNCTIONS.get(name, name or "relu"), {}
 
@@ -300,7 +364,7 @@ class TorchBackend(Backend):
         except TraceError:
             raise
         except Exception as exc:
-            return self._linear_graph(model, reason=str(exc).splitlines()[0][:160])
+            return self._linear_graph(model, str(exc).splitlines()[0][:160], input_spec)
 
     def _fx_graph(self, model: Any, input_spec: Any = None) -> ModelGraph:
         from torch import fx
@@ -315,6 +379,10 @@ class TorchBackend(Backend):
                 # it into primitives and the graph loses the fact that it is one
                 # activation with one profile.
                 if leaf_types and isinstance(m, leaf_types):
+                    return True
+                # Likewise a known activation class from another library.  Only its name
+                # is read here: touching its parameters during the trace breaks FX.
+                if _qualname(m) in _THIRD_PARTY_ACTIVATIONS:
                     return True
                 return super().is_leaf_module(m, qualname)
 
@@ -375,21 +443,29 @@ class TorchBackend(Backend):
                 return out
 
         try:
-            specs = input_spec if isinstance(input_spec, list) else [input_spec]
-            args = []
-            for spec in specs:
-                if isinstance(spec, torch.Tensor):
-                    args.append(torch.zeros_like(spec[:1], device=self._device))
-                elif isinstance(spec, tuple) and spec and all(isinstance(d, int) for d in spec):
-                    args.append(torch.zeros((1, *spec[1:]), dtype=self._dtype, device=self._device))
-                else:
-                    return {}
+            args = self._probe_args(input_spec)
+            if args is None:
+                return {}
             # Eval mode: a training-mode pass would count a batch on every BatchNorm.
             with _preserved_running_stats(graph_module, training=False), torch.no_grad():
                 _quiet(ShapeRecorder(graph_module)).run(*args)
         except Exception:
             return {}
         return shapes
+
+    def _probe_args(self, input_spec: Any) -> list[Any] | None:
+        """A one-row batch of zeros per model input, or ``None`` if the spec has no shape."""
+        torch = self._torch
+        specs = input_spec if isinstance(input_spec, list) else [input_spec]
+        args = []
+        for spec in specs:
+            if isinstance(spec, torch.Tensor):
+                args.append(torch.zeros_like(spec[:1], device=self._device))
+            elif isinstance(spec, tuple) and spec and all(isinstance(d, int) for d in spec):
+                args.append(torch.zeros((1, *spec[1:]), dtype=self._dtype, device=self._device))
+            else:
+                return None
+        return args
 
     def _classify(
         self,
@@ -439,15 +515,14 @@ class TorchBackend(Backend):
             kind = NodeKind.MERGE if len(inputs) > 1 else NodeKind.SHAPE
             return [Node(nid, kind, op, inputs)]
 
-        canonical = _ACTIVATION_FUNCTIONS.get(name)
-        if canonical is not None:
-            params = _function_activation_params(canonical, fx_node)
+        if name in _ACTIVATION_FUNCTIONS:
+            canonical, params, fetched = _function_activation(name, fx_node, graph_module)
             return [
                 Node(
                     nid,
                     NodeKind.ACTIVATION,
                     canonical,
-                    inputs,
+                    tuple(i for i in inputs if i != fetched),
                     meta={"activation": ActivationRef.of(canonical, **params)},
                 )
             ]
@@ -494,9 +569,9 @@ class TorchBackend(Backend):
                 )
             ]
 
-        if cls in _ACTIVATION_MODULES:
-            canonical = _ACTIVATION_MODULES[cls]
-            params = _module_activation_params(canonical, module)
+        found = _module_activation(module)
+        if found is not None:
+            canonical, params = found
             return [
                 Node(
                     nid,
@@ -769,18 +844,33 @@ class TorchBackend(Backend):
             return fanmod.ParamSpec(fanmod.CONV, shape, groups=groups, has_bias=has_bias)
         return fanmod.ParamSpec(fanmod.DENSE, shape, has_bias=has_bias)
 
-    def _linear_graph(self, model: Any, reason: str) -> ModelGraph:
-        """Ordered chain from ``named_modules``, for models FX cannot trace."""
-        nodes: list[Node] = [Node("input", NodeKind.INPUT, "input")]
-        previous = "input"
-        seen: set[int] = set()
+    def _linear_graph(self, model: Any, reason: str, input_spec: Any = None) -> ModelGraph:
+        """Ordered chain of leaf modules, for models FX cannot trace.
 
+        The chain follows the order the modules run in, recorded on a probe pass, since a
+        module may be registered before the layer that feeds it.  When no pass can be
+        made, it follows registration order instead.
+        """
+        leaves: list[tuple[str, Any]] = []
+        seen: set[int] = set()
         for path, module in model.named_modules():
             if not path or id(module) in seen:
                 continue
             if next(module.children(), None) is not None:
                 continue  # Containers contribute nothing; their leaves do.
             seen.add(id(module))
+            leaves.append((path, module))
+
+        ordered, failure = self._execution_order(model, leaves, input_spec)
+        if ordered is not None:
+            order = "execution order"
+            leaves = ordered
+        else:
+            order = f"registration order (the execution order could not be recorded: {failure})"
+
+        nodes: list[Node] = [Node("input", NodeKind.INPUT, "input")]
+        previous = "input"
+        for path, module in leaves:
             nid = path.replace(".", "_")
             built = self._from_module(nid, path, module, (previous,), ())
             nodes.extend(built)
@@ -792,9 +882,44 @@ class TorchBackend(Backend):
             fidelity=FIDELITY_LINEAR,
             notes=(
                 f"torch.fx could not trace this model ({reason}); fell back to module "
-                "registration order, so branches and residual connections are invisible",
+                f"{order}, so branches and residual connections are invisible",
             ),
         )
+
+    def _execution_order(
+        self, model: Any, leaves: list[tuple[str, Any]], input_spec: Any
+    ) -> tuple[list[tuple[str, Any]] | None, str]:
+        """``leaves`` sorted by first call on a one-row probe, or ``None`` and why not.
+
+        Leaves the probe never reaches keep their registration order, after the rest.
+        """
+        torch = self._torch
+        args = self._probe_args(input_spec) if input_spec is not None else None
+        if args is None:
+            return None, "no input shape to run the model on"
+
+        first_call: dict[int, int] = {}
+
+        def note(module: Any, _inputs: Any) -> None:
+            first_call.setdefault(id(module), len(first_call))
+
+        handles = [module.register_forward_pre_hook(note) for _, module in leaves]
+        try:
+            with _preserved_running_stats(model, training=False), torch.no_grad():
+                model(*args)
+        except Exception as exc:
+            return None, f"the probe pass raised {type(exc).__name__}"
+        finally:
+            for handle in handles:
+                handle.remove()
+        if not first_call:
+            return None, "no module ran on the probe pass"
+
+        ran = sorted(
+            (item for item in leaves if id(item[1]) in first_call),
+            key=lambda item: first_call[id(item[1])],
+        )
+        return ran + [item for item in leaves if id(item[1]) not in first_call], ""
 
     def unscaled_weights(self, model: Any, graph: ModelGraph) -> list[tuple[str, str]]:
         """Every ``>= 2``-d parameter no graph node writes, with the reason."""
@@ -1033,10 +1158,7 @@ def _constant_factor(fx_node: Any, graph_module: Any) -> tuple[MomentState, str 
     if isinstance(operand, (int, float)) and not isinstance(operand, bool):
         constant = np.asarray(float(operand))
     elif isinstance(operand, fx.Node) and operand.op == "get_attr":
-        tensor = graph_module
-        for part in str(operand.target).split("."):
-            tensor = getattr(tensor, part)
-        constant = tensor.detach().to("cpu").double().numpy()
+        constant = _fetched_tensor(operand, graph_module).double().numpy()
     else:
         return None  # a computed tensor: a merge
 
@@ -1309,9 +1431,30 @@ def _spatial_rank(name: str) -> int:
     return int(match.group(1)) if match else 2
 
 
+def _qualname(obj: Any) -> str:
+    cls = type(obj)
+    return f"{cls.__module__}.{cls.__qualname__}"
+
+
+def _module_activation(module: Any) -> tuple[str, dict[str, float]] | None:
+    """Canonical name and shape parameters of an activation module, or ``None``."""
+    canonical = _THIRD_PARTY_ACTIVATIONS.get(_qualname(module))
+    if canonical is None:
+        canonical = _ACTIVATION_MODULES.get(type(module).__name__)
+    if canonical is None:
+        return None
+    if canonical == "gelu" and getattr(module, "approximate", "none") == "tanh":
+        canonical = "gelu_tanh"
+    return canonical, _module_activation_params(canonical, module)
+
+
 def _module_activation_params(canonical: str, module: Any) -> dict[str, float]:
     if canonical == "leaky_relu":
         slope = getattr(module, "negative_slope", None)
+        weight = getattr(module, "weight", None)
+        if slope is None and weight is not None:
+            # PReLU: one learned slope, or one per channel, summarized by their mean.
+            slope = float(weight.detach().to("cpu").double().mean())
         if slope is None:
             lower = getattr(module, "lower", 0.125)
             upper = getattr(module, "upper", 1.0 / 3.0)
@@ -1326,9 +1469,46 @@ def _module_activation_params(canonical: str, module: Any) -> dict[str, float]:
             "lo": float(getattr(module, "min_val", -1.0)),
             "hi": float(getattr(module, "max_val", 1.0)),
         }
-    if canonical == "gelu" and getattr(module, "approximate", "none") == "tanh":
-        return {}
+    if canonical == "clipped_gelu":
+        return {
+            "lo": float(getattr(module, "min", -10.0)),
+            "hi": float(getattr(module, "max", 10.0)),
+        }
+    if canonical in ("hardshrink", "softshrink"):
+        return {"lambd": float(getattr(module, "lambd", 0.5))}
+    if canonical == "threshold":
+        return {
+            "threshold": float(getattr(module, "threshold", 0.0)),
+            "value": float(getattr(module, "value", 0.0)),
+        }
     return {}
+
+
+def _function_activation(
+    name: str, fx_node: Any, graph_module: Any
+) -> tuple[str, dict[str, float], str | None]:
+    """Canonical name, shape parameters and fetched-weight node of a functional call.
+
+    The third element names the ``get_attr`` node of a ``prelu`` weight, which is not a
+    signal input.
+    """
+    canonical = _ACTIVATION_FUNCTIONS[name]
+    base = name.rstrip("_")
+    if base == "prelu":
+        weight = _arg(fx_node, 1, "weight", None)
+        tensor = _fetched_tensor(weight, graph_module)
+        slope = 0.25 if tensor is None else float(tensor.double().mean())
+        fetched = weight.name if tensor is not None else None
+        return canonical, {"negative_slope": slope}, fetched
+    if base == "rrelu":
+        lower = float(_arg(fx_node, 1, "lower", 1.0 / 8.0))
+        upper = float(_arg(fx_node, 2, "upper", 1.0 / 3.0))
+        return canonical, {"negative_slope": 0.5 * (lower + upper)}, None
+    if base == "gelu":
+        if _arg(fx_node, 1, "approximate", "none") == "tanh":
+            return "gelu_tanh", {}, None
+        return canonical, {}, None
+    return canonical, _function_activation_params(canonical, fx_node), None
 
 
 def _function_activation_params(canonical: str, fx_node: Any) -> dict[str, float]:
@@ -1338,4 +1518,28 @@ def _function_activation_params(canonical: str, fx_node: Any) -> dict[str, float
         return {"alpha": float(_arg(fx_node, 1, "alpha", 1.0))}
     if canonical == "softplus":
         return {"beta": float(_arg(fx_node, 1, "beta", 1.0))}
+    if canonical == "hardtanh":
+        return {
+            "lo": float(_arg(fx_node, 1, "min_val", -1.0)),
+            "hi": float(_arg(fx_node, 2, "max_val", 1.0)),
+        }
+    if canonical in ("hardshrink", "softshrink"):
+        return {"lambd": float(_arg(fx_node, 1, "lambd", 0.5))}
+    if canonical == "threshold":
+        return {
+            "threshold": float(_arg(fx_node, 1, "threshold", 0.0)),
+            "value": float(_arg(fx_node, 2, "value", 0.0)),
+        }
     return {}
+
+
+def _fetched_tensor(operand: Any, graph_module: Any) -> Any:
+    """The parameter or buffer a ``get_attr`` node reads, on the CPU, or ``None``."""
+    from torch import fx
+
+    if not isinstance(operand, fx.Node) or operand.op != "get_attr":
+        return None
+    tensor = graph_module
+    for part in str(operand.target).split("."):
+        tensor = getattr(tensor, part)
+    return tensor.detach().to("cpu")

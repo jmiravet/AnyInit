@@ -126,6 +126,61 @@ def exponential(x: Array) -> Array:
     return np.exp(np.minimum(x, 60.0))
 
 
+def quick_gelu(x: Array) -> Array:
+    """Sigmoid approximation of GELU, ``x*sigmoid(1.702*x)``, as in CLIP."""
+    return x * sigmoid(1.702 * x)
+
+
+def clipped_gelu(x: Array, lo: float = -10.0, hi: float = 10.0) -> Array:
+    """Exact GELU clipped to ``[lo, hi]``."""
+    return np.clip(gelu(x), lo, hi)
+
+
+def relu2(x: Array) -> Array:
+    """Squared ReLU, ``max(x, 0)**2``."""
+    return np.maximum(x, 0.0) ** 2
+
+
+def log_sigmoid(x: Array) -> Array:
+    """Logarithm of the logistic function, ``-softplus(-x)``."""
+    return -softplus(-x)
+
+
+def sqrt_softplus(x: Array) -> Array:
+    """Square root of softplus."""
+    return np.sqrt(softplus(x))
+
+
+def hardshrink(x: Array, lambd: float = 0.5) -> Array:
+    """Zero inside ``[-lambd, lambd]``, identity outside."""
+    return np.where(np.abs(x) > lambd, x, 0.0)
+
+
+def softshrink(x: Array, lambd: float = 0.5) -> Array:
+    """Shrink towards zero by ``lambd``, zero inside ``[-lambd, lambd]``."""
+    return np.sign(x) * np.maximum(np.abs(x) - lambd, 0.0)
+
+
+def tanhshrink(x: Array) -> Array:
+    """``x - tanh(x)``."""
+    return x - np.tanh(x)
+
+
+def threshold(x: Array, threshold: float = 0.0, value: float = 0.0) -> Array:
+    """Identity above ``threshold``, the constant ``value`` elsewhere."""
+    return np.where(x > threshold, x, value)
+
+
+def hard_mish(x: Array) -> Array:
+    """Piecewise-quadratic approximation of mish, ``x*clip(x+2, 0, 2)/2``."""
+    return np.asarray(0.5 * x * np.clip(x + 2.0, 0.0, 2.0))
+
+
+def laplace(x: Array, mu: float = 0.707107, sigma: float = 0.282095) -> Array:
+    """Normal CDF centered at ``mu`` with scale ``sigma``, from MEGA."""
+    return np.asarray(0.5 * (1.0 + _erf((x - mu) / (sigma * _SQRT_2))))
+
+
 #: Canonical activation name -> NumPy implementation.  Backends translate their native ops
 #: into these names; anything missing is reported as an unknown op.
 BUILTIN: dict[str, ActivationFn] = {
@@ -150,11 +205,22 @@ BUILTIN: dict[str, ActivationFn] = {
     "hardsigmoid": hardsigmoid,
     "hardswish": hardswish,
     "exponential": exponential,
+    "quick_gelu": quick_gelu,
+    "clipped_gelu": clipped_gelu,
+    "relu2": relu2,
+    "log_sigmoid": log_sigmoid,
+    "sqrt_softplus": sqrt_softplus,
+    "hardshrink": hardshrink,
+    "softshrink": softshrink,
+    "tanhshrink": tanhshrink,
+    "threshold": threshold,
+    "hard_mish": hard_mish,
+    "laplace": laplace,
 }
 
 #: Activations whose output is not a pointwise function of the input, so one-dimensional
 #: quadrature cannot profile them.  Treated as shape-preserving and reported.
-NON_POINTWISE = frozenset({"softmax", "log_softmax", "glu", "logsigmoid_pair"})
+NON_POINTWISE = frozenset({"softmax", "log_softmax", "softmin", "glu"})
 
 
 def parameterized(name: str, **kwargs: float) -> ActivationFn | None:

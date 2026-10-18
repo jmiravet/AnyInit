@@ -1,5 +1,78 @@
 # Changelog
 
+## 0.4.0
+
+### More activations
+
+Several activations common in Hugging Face and timm models were scaled as if they were
+linear, with no warning, or were traced into the primitives they are built from and
+profiled piece by piece. They are now recognized and profiled as one function.
+
+**New NumPy references** (`core/activations.py`)
+
+- `quick_gelu`, `relu2`, `log_sigmoid`, `sqrt_softplus`, `clipped_gelu`, `hardshrink`,
+  `softshrink`, `tanhshrink`, `threshold`, `hard_mish` and `laplace`.
+- `softmin` is marked as not pointwise, so it is reported instead of passing silently.
+
+**PyTorch**
+
+- `nn.PReLU` and `F.prelu`, profiled as a leaky ReLU with the mean learned slope.
+- `nn.LogSigmoid`, `Hardshrink`, `Softshrink`, `Tanhshrink`, `Threshold`, and their
+  functional forms, with their parameters.
+- `GELU(approximate="tanh")` and `F.gelu(..., approximate="tanh")` are now `gelu_tanh`
+  rather than exact `gelu`.
+- The activation classes of `transformers.activations` (`NewGELUActivation`,
+  `QuickGELUActivation`, `ReLUSquaredActivation`, …) and of `timm.layers` (`Swish`,
+  `HardSwish`, `HardMish`, `QuickGELU`, …) are kept whole by the FX tracer. They are
+  matched by module and qualified name, so neither library is imported and a user class
+  with the same name is still traced into.
+- In-place variants (`relu_`, `sigmoid_`, …) and `F.rrelu` are recognized.
+- `F.hardtanh` keeps its `min_val` and `max_val`. Before, it was profiled on `[-1, 1]`.
+
+**Keras**: `log_sigmoid`, `hard_shrink`, `soft_shrink` and `tanh_shrink`.
+
+**Flax**: `jax.nn.log_sigmoid` is intercepted, and `quick_gelu`, `relu2`, `hard_mish` and
+`log_sigmoid` can be identified from their values.
+
+### PyTorch fallback follows execution order
+
+When `torch.fx` cannot trace a model, the chain of leaf modules used to follow their
+registration order. A module registered before the layer that feeds it was then paired
+with the wrong layer. Hugging Face's `CLIPMLP`, for example, creates its activation
+before `fc1`, so `quick_gelu` was credited to the preceding `LayerNorm`.
+
+- The chain now follows the order the modules first run in. That order is recorded by
+  forward pre-hooks on a one-row probe of zeros, in eval mode, without gradients, and
+  with running statistics restored afterwards. Modules the probe never reaches go last,
+  in registration order.
+- When no probe can be made, because there is no input shape or because the pass raises,
+  the chain falls back to registration order as before. The report note says which
+  order was used and, if needed, why the execution order could not be recorded.
+
+### Behavior change
+
+Models whose activations were already recognized, and that FX can trace, get the same
+weights as in 0.3.0. These do not:
+
+| Model | Weight | 0.3.0 | now (analytic) |
+|---|---|---|---|
+| timm `vit_base_patch32_clip_quickgelu_224` | `blocks.0.mlp.fc1.weight` | 0.0283 | 0.0266 |
+| HF `CLIPVisionModel` (FX fallback) | `layers.*.mlp.fc1.weight` | 0.0884 | 0.1303 |
+| HF `BertModel` (FX fallback) | `layer.*.intermediate.dense.weight` | 0.0884 | 0.1298 |
+| HF `BertModel` (FX fallback) | `pooler.dense.weight` | 0.1121 | 0.1182 |
+
+In the two FX-fallback models, GELU and QuickGELU were scaled as linear before. In the
+timm model, QuickGELU was profiled as the separate pieces it is built from.
+
+### Testing
+
+- Full suite: 483 passed (PyTorch, Keras on TensorFlow, Flax). 64 tests are new.
+- `ruff check`, `ruff format --check` and `mypy` are clean.
+- 0.3.0 and this version were compared on every parameter, in both modes. They give
+  identical results on ResNet18, MobileNetV3, EfficientNet-B0, ConvNeXt-tiny and
+  ViT-B/16 from torchvision, on timm's ViT-tiny and MobileNetV3, and on
+  `nn.TransformerEncoderLayer`. They differ only in the rows above.
+
 ## 0.3.0
 
 ### Tied embeddings and constant factors

@@ -39,9 +39,10 @@ translate layouts, read and write parameters, and run forward passes returning
 5. **Mode purity.** No measurement ever sets an `analytic` scale. The model is run only
    for the validation pass, which runs when `input_spec` is given and whose result
    reaches the report alone; under Flax, for a 16-row probe that identifies
-   activations (below); and under PyTorch, when the model has adaptive pooling, for a
-   one-row batch of zeros that reads the shapes off. `empirical` never consults a
-   Gaussian profile to set a scale.
+   activations (below); and under PyTorch, for a one-row batch of zeros, when the model
+   has adaptive pooling, to read the shapes off, and when `torch.fx` cannot trace it, to
+   record the order its modules run in. `empirical` never consults a Gaussian profile to
+   set a scale.
 6. **Weights drawn in NumPy.** The same seed gives the same weights under every backend.
 7. **Fail visibly.** Anything AnyInit cannot do correctly goes into the report rather
    than being approximated silently.
@@ -64,7 +65,7 @@ ordinary one, so fans computed on the native shape come out inverted.
 
 | Framework | Mechanism | Fidelity |
 |---|---|---|
-| PyTorch | `torch.fx` symbolic trace; shapes from a one-row probe | graph; falls back to a linear chain from `named_modules` when tracing fails |
+| PyTorch | `torch.fx` symbolic trace; shapes from a one-row probe | graph; falls back to a linear chain of leaf modules when tracing fails, in the order they run on a one-row probe, or in registration order if the model cannot be run |
 | Keras | `model.operations` and each operation's inbound nodes | graph; linear for an unwired Sequential |
 | Flax | Flax layers and `jax.nn` activations wrapped inside a context manager, then the model applied to a 16-row probe | linear |
 

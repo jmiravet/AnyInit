@@ -71,6 +71,7 @@ _ACTIVATION_ATTRS: tuple[str, ...] = (
     "hard_sigmoid",
     "hard_silu",
     "hard_swish",
+    "log_sigmoid",
     "softmax",
     "log_softmax",
     "identity",
@@ -699,6 +700,10 @@ _IDENTIFIABLE: tuple[str, ...] = (
     "hardswish",
     "relu6",
     "leaky_relu",
+    "quick_gelu",
+    "relu2",
+    "hard_mish",
+    "log_sigmoid",
 )
 
 

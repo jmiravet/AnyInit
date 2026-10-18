@@ -167,6 +167,64 @@ def test_control_flow_falls_back_to_a_linear_graph(backend):
     assert any("could not trace" in note for note in graph.notes)
 
 
+class _ActivationFirst(nn.Module):
+    """Registers its activation before the layer feeding it, as Hugging Face's CLIP does."""
+
+    def __init__(self):
+        super().__init__()
+        self.norm = nn.LayerNorm(64)
+        self.act = nn.GELU()
+        self.fc1 = nn.Linear(64, 64)
+        self.fc2 = nn.Linear(64, 64)
+        self.bn = nn.BatchNorm1d(64)
+
+    def forward(self, x):
+        if float(x.sum()) > 1e9:  # Data-dependent control flow: FX cannot trace this.
+            x = x * 2
+        return self.bn(self.fc2(self.act(self.fc1(self.norm(x)))))
+
+
+def test_fallback_follows_execution_order(backend):
+    model = _ActivationFirst()
+    graph = backend.build_graph(model, (16, 64))
+    assert graph.fidelity == FIDELITY_LINEAR
+    assert list(graph.order[1:-1]) == ["norm", "fc1", "act", "fc2", "bn"]
+    assert any("execution order" in note for note in graph.notes)
+
+    report = anyinit.initialize(model, "analytic", (16, 64), seed=0)
+    by_name = {layer.name: layer.activation for layer in report.layers}
+    assert by_name["fc1"] == "gelu"
+    assert by_name["norm"] == "none"
+
+
+def test_fallback_probe_leaves_the_model_as_it_was(backend):
+    model = _ActivationFirst().train()
+    before = model.bn.running_mean.clone(), int(model.bn.num_batches_tracked)
+    backend.build_graph(model, (16, 64))
+    assert model.training
+    assert torch.equal(model.bn.running_mean, before[0])
+    assert int(model.bn.num_batches_tracked) == before[1]
+    assert not any(m._forward_pre_hooks for m in model.modules())
+
+
+def test_fallback_without_a_probe_uses_registration_order(backend):
+    graph = backend.build_graph(_ActivationFirst())
+    assert list(graph.order[1:-1]) == ["norm", "act", "fc1", "fc2", "bn"]
+    assert any("registration order" in note and "no input shape" in note for note in graph.notes)
+
+
+def test_fallback_when_the_probe_raises_uses_registration_order(backend):
+    class Broken(_ActivationFirst):
+        def forward(self, x):
+            if float(x.sum()) == 0:  # Untraceable, and fails on the all-zeros probe.
+                raise ValueError("probe")
+            return super().forward(x)
+
+    graph = backend.build_graph(Broken(), (16, 64))
+    assert list(graph.order[1:-1]) == ["norm", "act", "fc1", "fc2", "bn"]
+    assert any("raised ValueError" in note for note in graph.notes)
+
+
 def test_transformer_encoder_layer_does_not_raise():
     """A stock PyTorch module that symbolic tracing cannot handle."""
     layer = nn.TransformerEncoderLayer(d_model=32, nhead=4, batch_first=True)
@@ -368,3 +426,164 @@ def test_a_logit_multiplier_gives_the_tied_table_a_scale_of_one():
     assert float(model.emb.weight.detach().std()) == pytest.approx(1.0, rel=1e-2)
     with torch.no_grad():
         assert float(model(idx).var()) == pytest.approx(1.0, rel=0.1)
+
+
+# ------------------------------------------------------------- activations
+
+
+class _Fn(nn.Module):
+    """A functional activation called inside ``forward()``."""
+
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def forward(self, x):
+        return self.fn(x)
+
+
+def _activation_of(backend, act):
+    graph = backend.build_graph(nn.Sequential(nn.Linear(8, 8), act, nn.Linear(8, 8)))
+    (node,) = graph.of_kind(NodeKind.ACTIVATION)
+    return str(node.meta["activation"])
+
+
+F = torch.nn.functional
+
+
+@pytest.mark.parametrize(
+    ("act", "expected"),
+    [
+        (nn.PReLU(), "leaky_relu(negative_slope=0.25)"),
+        (nn.PReLU(8, init=0.1), "leaky_relu(negative_slope=0.1)"),
+        (nn.GELU(approximate="tanh"), "gelu_tanh"),
+        (nn.LogSigmoid(), "log_sigmoid"),
+        (nn.Hardshrink(0.3), "hardshrink(lambd=0.3)"),
+        (nn.Softshrink(), "softshrink(lambd=0.5)"),
+        (nn.Tanhshrink(), "tanhshrink"),
+        (nn.Threshold(0.1, -0.5), "threshold(threshold=0.1, value=-0.5)"),
+        (nn.Softmin(dim=-1), "softmin"),
+        (_Fn(lambda x: F.gelu(x, approximate="tanh")), "gelu_tanh"),
+        (_Fn(lambda x: F.hardtanh(x, 0.0, 6.0)), "hardtanh(hi=6, lo=0)"),
+        (_Fn(lambda x: F.rrelu(x, 0.1, 0.3)), "leaky_relu(negative_slope=0.2)"),
+        (_Fn(F.logsigmoid), "log_sigmoid"),
+        (_Fn(lambda x: F.softshrink(x, 0.2)), "softshrink(lambd=0.2)"),
+        (_Fn(lambda x: F.threshold(x, 0.1, 0.0)), "threshold(threshold=0.1, value=0)"),
+        (_Fn(torch.relu_), "relu"),
+        (_Fn(lambda x: x.sigmoid_()), "sigmoid"),
+    ],
+    ids=lambda v: v if isinstance(v, str) else type(v).__name__,
+)
+def test_activation_is_recognized_with_its_parameters(backend, act, expected):
+    assert _activation_of(backend, act) == expected
+
+
+def test_functional_prelu_reads_its_weight_and_leaves_it_out_of_the_signal(backend):
+    class Net(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fc = nn.Linear(8, 8)
+            self.slope = nn.Parameter(torch.full((8,), 0.2))
+
+        def forward(self, x):
+            return F.prelu(self.fc(x), self.slope)
+
+    graph = backend.build_graph(Net())
+    (node,) = graph.of_kind(NodeKind.ACTIVATION)
+    assert str(node.meta["activation"]) == "leaky_relu(negative_slope=0.2)"
+    assert [graph[i].kind for i in node.inputs] == [NodeKind.PARAMETRIC]
+
+
+@pytest.mark.parametrize(
+    ("name", "kwargs", "native"),
+    [
+        ("gelu_tanh", {}, lambda x: F.gelu(x, approximate="tanh")),
+        ("quick_gelu", {}, lambda x: x * torch.sigmoid(1.702 * x)),
+        ("relu2", {}, lambda x: torch.relu(x) ** 2),
+        ("log_sigmoid", {}, F.logsigmoid),
+        ("sqrt_softplus", {}, lambda x: F.softplus(x).sqrt()),
+        ("clipped_gelu", {"lo": -1.0, "hi": 1.0}, lambda x: F.gelu(x).clip(-1.0, 1.0)),
+        ("hardshrink", {"lambd": 0.3}, lambda x: F.hardshrink(x, 0.3)),
+        ("softshrink", {"lambd": 0.3}, lambda x: F.softshrink(x, 0.3)),
+        ("tanhshrink", {}, F.tanhshrink),
+        ("threshold", {"threshold": 0.1, "value": -0.5}, lambda x: F.threshold(x, 0.1, -0.5)),
+        ("hard_mish", {}, lambda x: 0.5 * x * (x + 2).clamp(0, 2)),
+        (
+            "laplace",
+            {},
+            lambda x: 0.5 * (1 + torch.erf((x - 0.707107) / (0.282095 * 2**0.5))),
+        ),
+    ],
+    ids=lambda v: v if isinstance(v, str) else "",
+)
+def test_numpy_reference_matches_torch(name, kwargs, native):
+    from anyinit.core.activations import BUILTIN
+
+    x = np.linspace(-12.0, 12.0, 4001)
+    expected = native(torch.from_numpy(x)).numpy()
+    assert np.allclose(BUILTIN[name](x, **kwargs), expected, rtol=0, atol=1e-12)
+
+
+def _hf(name):
+    pytest.importorskip("transformers")
+    from transformers.activations import ACT2FN
+
+    return ACT2FN[name]
+
+
+def _timm(name):
+    pytest.importorskip("timm")
+    from timm.layers import activations, activations_me
+
+    return getattr(activations, name, None) or getattr(activations_me, name)
+
+
+@pytest.mark.parametrize(
+    ("make", "expected"),
+    [
+        (lambda: _hf("gelu_new"), "gelu_tanh"),
+        (lambda: _hf("gelu_fast"), "gelu_tanh"),
+        (lambda: _hf("gelu_accurate"), "gelu_tanh"),
+        (lambda: _hf("gelu_python_tanh"), "gelu_tanh"),
+        (lambda: _hf("gelu_python"), "gelu"),
+        (lambda: _hf("gelu_10"), "clipped_gelu(hi=10, lo=-10)"),
+        (lambda: _hf("quick_gelu"), "quick_gelu"),
+        (lambda: _hf("relu2"), "relu2"),
+        (lambda: _hf("sqrtsoftplus"), "sqrt_softplus"),
+        (lambda: _hf("laplace"), "laplace"),
+        (lambda: _timm("Swish")(), "silu"),
+        (lambda: _timm("HardSwish")(), "hardswish"),
+        (lambda: _timm("HardMish")(), "hard_mish"),
+        (lambda: _timm("QuickGELU")(), "quick_gelu"),
+        (lambda: _timm("PReLU")(), "leaky_relu(negative_slope=0.25)"),
+        (lambda: _timm("HardSigmoidMe")(), "hardsigmoid"),
+    ],
+    ids=[
+        "hf-gelu_new", "hf-gelu_fast", "hf-gelu_accurate", "hf-gelu_python_tanh",
+        "hf-gelu_python", "hf-gelu_10", "hf-quick_gelu", "hf-relu2", "hf-sqrtsoftplus",
+        "hf-laplace", "timm-Swish", "timm-HardSwish", "timm-HardMish", "timm-QuickGELU",
+        "timm-PReLU", "timm-HardSigmoidMe",
+    ],
+)  # fmt: skip
+def test_third_party_activation_class_is_kept_whole(backend, make, expected):
+    """Check that a library's activation class is one node, not the primitives inside it."""
+    assert _activation_of(backend, make()) == expected
+
+
+def test_third_party_activation_is_scaled_for(backend):
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(256, 256), _hf("gelu_new"), nn.Linear(256, 256))
+    report = anyinit.initialize(model, "analytic", (2048, 256), seed=0)
+    assert report.layers[0].activation == "gelu_tanh"
+    assert report.layers[-1].measured == pytest.approx(1.0, rel=0.05)
+
+
+class QuickGELUActivation(nn.Module):
+    """Shares a transformers class name, but is not that class."""
+
+    def forward(self, x):
+        return torch.tanh(x)
+
+
+def test_class_sharing_a_third_party_name_is_traced_into(backend):
+    assert _activation_of(backend, QuickGELUActivation()) == "tanh"

@@ -326,3 +326,26 @@ def test_a_logit_multiplier_gives_the_tied_table_a_scale_of_one():
     table = np.asarray(params["params"]["Embed_0"]["embedding"])
     assert table.std() == pytest.approx(1.0, rel=1e-2)
     assert float(model.apply(params, idx).var()) == pytest.approx(1.0, rel=0.1)
+
+
+@pytest.mark.parametrize(
+    ("expected", "act"),
+    [
+        ("log_sigmoid", jax.nn.log_sigmoid),
+        ("quick_gelu", lambda x: x * jax.nn.sigmoid(1.702 * x)),
+        ("relu2", lambda x: jax.nn.relu(x) ** 2),
+        ("hard_mish", lambda x: 0.5 * x * jnp.clip(x + 2.0, 0.0, 2.0)),
+    ],
+    ids=lambda v: v if isinstance(v, str) else "",
+)
+def test_activation_is_called_or_identified(expected, act):
+    class Net(nn.Module):
+        @nn.compact
+        def __call__(self, x):
+            return nn.Dense(256)(act(nn.Dense(256)(x)))
+
+    model = Net()
+    params = model.init(jax.random.key(0), jnp.ones((1, 256)))
+    report = anyinit.initialize(model, "analytic", (2048, 256), params=params, seed=0)
+    assert report.layers[0].activation == expected
+    assert report.layers[-1].measured == pytest.approx(1.0, rel=0.06)

@@ -237,3 +237,25 @@ def test_rescaling_is_applied_before_the_first_layer():
     )
     report = anyinit.initialize(model, input_spec=pixels, seed=0)
     report.assert_healthy()
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("log_sigmoid", "log_sigmoid"),
+        ("hard_shrink", "hardshrink"),
+        ("soft_shrink", "softshrink"),
+        ("tanh_shrink", "tanhshrink"),
+    ],
+)
+@pytest.mark.parametrize("style", ["fused", "layer"])
+def test_activation_is_recognized_by_name(name, expected, style):
+    inputs = keras.Input((256,))
+    if style == "fused":
+        hidden = layers.Dense(256, activation=name)(inputs)
+    else:
+        hidden = layers.Activation(name)(layers.Dense(256)(inputs))
+    model = keras.Model(inputs, layers.Dense(256)(hidden))
+    report = anyinit.initialize(model, "analytic", (2048, 256), seed=0)
+    assert report.layers[0].activation == expected
+    assert report.layers[-1].measured == pytest.approx(1.0, rel=0.06)

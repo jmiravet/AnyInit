@@ -58,6 +58,10 @@ _ACTIVATION_NAMES: dict[str, str] = {
     "hard_swish": "hardswish",
     "linear": "identity",
     "exponential": "exponential",
+    "log_sigmoid": "log_sigmoid",
+    "hard_shrink": "hardshrink",
+    "soft_shrink": "softshrink",
+    "tanh_shrink": "tanhshrink",
     "softmax": "softmax",
     "log_softmax": "log_softmax",
 }

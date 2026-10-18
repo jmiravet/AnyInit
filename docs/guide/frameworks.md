@@ -26,11 +26,11 @@ architectures are scaled as if they were sequential, and the report says `graph=
 |---|---|---|---|
 | traced via | `torch.fx` | `model.operations` | instrumented call on a 16-row probe |
 | branches and merges | yes | yes | no — ordered chain |
-| activations | modules and functions | layers and fused `activation=` | `jax.nn` calls, and any other recognized from its values |
+| activations | modules and functions, including the activation classes of `transformers` and `timm` | layers and fused `activation=` | `jax.nn` calls, and any other recognized from its values |
 | transformer layers | `nn.Transformer*` expanded into attention, residuals and FFN | — | — |
 | constant factors | numbers, buffers and parameters in `x * c`, `x / c` | numbers in operations, `Rescaling` | scalar factors, recognized from their values |
 | [tied embeddings](../experiments/tied-embeddings.md) | shared `Parameter`, `F.linear` or `@` on the table | keras_hub `ReversibleEmbedding` | `Embed.attend` |
-| fallback when tracing fails | linear | linear | — |
+| fallback when tracing fails | linear, in execution order (registration order if the model cannot be run) | linear | — |
 | weights left untouched (recurrent, bare parameters) | listed in the report | listed in the report | listed in the report |
 | parameters | in place | in place | functional, returns a new tree |
 
